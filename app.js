@@ -2352,7 +2352,7 @@
   renderTeacher();
   renderInitialSavedAnswers();
   if (needsFirstClassCodeSave || needsTeacherCodeSave) persist();
-  if (state.view !== "explore") showView(state.view);
+  showView(state.view);
   updateReplayControls();
   })();
 })();

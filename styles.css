@@ -934,6 +934,19 @@ input[type="range"] { height: 20px; margin-top: 5px; }
 .teacher-recovery-key-content { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 7px; }
 .teacher-recovery-key-content strong { color: #536b58; font-size: 16px; letter-spacing: 1px; }
 .teacher-recovery-key-content small { flex-basis: 100%; color: #849087; font-size: 11px; line-height: 1.4; }
+.teacher-backup-tools { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px 14px; grid-column: 1 / -1; max-width: 760px; padding: 12px 0 2px; border-top: 1px solid #ecebe2; }
+.teacher-backup-tools h3 { margin: 0 0 4px; color: #405b49; font-family: Georgia, serif; font-size: 17px; }
+.teacher-backup-tools p { margin: 0; color: #748279; font-size: 11px; line-height: 1.5; }
+.teacher-backup-tools > button { align-self: center; white-space: nowrap; }
+.backup-link-result { display: grid; gap: 6px; grid-column: 1 / -1; padding-top: 4px; }
+.backup-link-result .field-label { margin: 0; }
+.backup-link-output { min-height: 68px; resize: vertical; overflow-wrap: anywhere; font-size: 11px; }
+.backup-link-actions { display: flex; align-items: center; gap: 10px; }
+.backup-link-actions [role="status"], #backup-link-help { color: #77857b; font-size: 11px; line-height: 1.45; }
+@media (max-width: 560px) {
+  .teacher-backup-tools { grid-template-columns: 1fr; }
+  .teacher-backup-tools > button { justify-self: start; }
+}
 .lesson-history-details { margin: 12px 0; }
 .lesson-history-details > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; cursor: pointer; list-style: none; color: #4f6d57; }
 .lesson-history-details > summary::-webkit-details-marker { display: none; }

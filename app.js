@@ -1,6 +1,107 @@
 (() => {
   "use strict";
 
+  const BACKUP_FORMAT = "fieldnotes-class-backup";
+  const BACKUP_VERSION = 1;
+  const BACKUP_MAX_LENGTH = 1500000;
+  const BACKUP_ITERATIONS = 310000;
+
+  function bytesToBase64Url(bytes) {
+    let binary = "";
+    bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  function base64UrlToBytes(value) {
+    const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(normalized + "=".repeat((4 - normalized.length % 4) % 4));
+    return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  }
+  function normalizeRecoveryCode(value) { return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, ""); }
+  function backupUrlWithoutHash() {
+    const url = new URL(window.location.href);
+    url.hash = "";
+    return url;
+  }
+  function clearBackupHash() {
+    const url = backupUrlWithoutHash();
+    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+  }
+  async function deriveBackupKey(classCode, teacherCode, salt) {
+    if (!window.crypto?.subtle) throw new Error("Secure encryption is unavailable in this browser. Open the published HTTPS site and try again.");
+    const passphrase = new TextEncoder().encode(`${normalizeRecoveryCode(classCode)}:${normalizeRecoveryCode(teacherCode)}`);
+    const material = await window.crypto.subtle.importKey("raw", passphrase, "PBKDF2", false, ["deriveKey"]);
+    return window.crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: BACKUP_ITERATIONS, hash: "SHA-256" }, material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+  async function encryptClassBackup(classRecord) {
+    const salt = window.crypto.getRandomValues(new Uint8Array(16));
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const key = await deriveBackupKey(classRecord.code, classRecord.teacherCode, salt);
+    const backup = { format: BACKUP_FORMAT, version: BACKUP_VERSION, createdAt: new Date().toISOString(), classRecord };
+    const plaintext = new TextEncoder().encode(JSON.stringify(backup));
+    const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`${BACKUP_FORMAT}:${BACKUP_VERSION}`) }, key, plaintext);
+    return `v${BACKUP_VERSION}.${bytesToBase64Url(salt)}.${bytesToBase64Url(iv)}.${bytesToBase64Url(new Uint8Array(encrypted))}`;
+  }
+  async function decryptClassBackup(payload, classCode, teacherCode) {
+    const parts = String(payload).split(".");
+    if (parts.length !== 4 || parts[0] !== `v${BACKUP_VERSION}`) throw new Error("Unsupported backup link.");
+    const salt = base64UrlToBytes(parts[1]);
+    const iv = base64UrlToBytes(parts[2]);
+    const ciphertext = base64UrlToBytes(parts[3]);
+    if (salt.length !== 16 || iv.length !== 12 || ciphertext.length < 32) throw new Error("The backup link is incomplete or damaged.");
+    const key = await deriveBackupKey(classCode, teacherCode, salt);
+    const plaintext = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: new TextEncoder().encode(`${BACKUP_FORMAT}:${BACKUP_VERSION}`) }, key, ciphertext);
+    const backup = JSON.parse(new TextDecoder().decode(plaintext));
+    if (backup?.format !== BACKUP_FORMAT || backup.version !== BACKUP_VERSION || !backup.classRecord || typeof backup.classRecord !== "object") throw new Error("This link does not contain a valid class backup.");
+    if (normalizeRecoveryCode(backup.classRecord.code) !== normalizeRecoveryCode(classCode) || normalizeRecoveryCode(backup.classRecord.teacherCode) !== normalizeRecoveryCode(teacherCode)) throw new Error("Those codes do not match this class backup.");
+    if (!Array.isArray(backup.classRecord.students) || !Array.isArray(backup.classRecord.questionPrompts) || !Array.isArray(backup.classRecord.workflowNotes)) throw new Error("The class backup is missing required class details.");
+    return backup;
+  }
+  function loadStoredWorkspace() {
+    try { return JSON.parse(localStorage.getItem("fieldnotes-soil-lab-v3") || localStorage.getItem("fieldnotes-soil-lab-v2") || "{}"); }
+    catch { return {}; }
+  }
+  function restoreClassBackup(backup) {
+    const record = backup.classRecord;
+    const workspace = loadStoredWorkspace();
+    const classes = Array.isArray(workspace.classes) ? workspace.classes : [];
+    const existingIndex = classes.findIndex((item) => normalizeRecoveryCode(item?.code) === normalizeRecoveryCode(record.code));
+    if (existingIndex >= 0 && normalizeRecoveryCode(classes[existingIndex].teacherCode) !== normalizeRecoveryCode(record.teacherCode)) throw new Error("A different saved class already uses this class code. Its data was left untouched.");
+    if (existingIndex >= 0) classes[existingIndex] = record;
+    else classes.push(record);
+    const next = { ...workspace, classes, activeClassId: record.id, introDone: true, currentStudentId: null, className: record.name, classCode: record.code, teacherCode: record.teacherCode };
+    localStorage.setItem("fieldnotes-soil-lab-v3", JSON.stringify(next));
+    localStorage.removeItem("fieldnotes-soil-lab-student-session");
+  }
+  async function handleClassBackupImport() {
+    const hash = window.location.hash || "";
+    if (!hash.startsWith("#backup=")) return false;
+    const payload = hash.slice("#backup=".length);
+    if (!window.confirm("This link contains an encrypted Fieldnotes class backup. Restore the class and its learner records on this device? You will need the class code and private teacher recovery code.")) {
+      clearBackupHash();
+      return false;
+    }
+    const classCode = window.prompt("Enter the class code:");
+    if (classCode === null) { clearBackupHash(); return false; }
+    const teacherCode = window.prompt("Enter the private teacher recovery code:");
+    if (teacherCode === null) { clearBackupHash(); return false; }
+    try {
+      if (payload.length > BACKUP_MAX_LENGTH) throw new Error("This backup link is too large to restore in a browser. Generate a smaller backup or use the same browser's local saved class.");
+      const backup = await decryptClassBackup(payload, classCode, teacherCode);
+      restoreClassBackup(backup);
+      clearBackupHash();
+      window.alert(`“${String(backup.classRecord.name || "Class").slice(0, 80)}” has been restored on this device.`);
+      window.location.reload();
+      return true;
+    } catch (error) {
+      clearBackupHash();
+      window.alert(`The class backup could not be restored. Check both codes and the link, then try again.\n\n${error?.message || "Invalid key or corrupted backup."}`);
+      return false;
+    }
+  }
+
+  (async () => {
+  if (await handleClassBackupImport()) return;
+
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
   const STORAGE_KEY = "fieldnotes-soil-lab-v3";
@@ -1926,6 +2027,47 @@
       setTimeout(() => { $("#copy-teacher-recovery-code").textContent = "Copy code"; }, 1800);
     } catch { showToast("Select and copy the teacher recovery code above."); }
   });
+  $("#generate-backup-link").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const status = $("#backup-link-status");
+    button.disabled = true;
+    button.textContent = "Encrypting class…";
+    status.textContent = "Preparing an encrypted copy of the active class.";
+    try {
+      const record = activeClass();
+      if (!record?.code || !record?.teacherCode) throw new Error("This class does not yet have both recovery codes. Generate or restore its codes, then try again.");
+      captureClassState();
+      persist();
+      const classCopy = JSON.parse(JSON.stringify(activeClass()));
+      const payload = await encryptClassBackup(classCopy);
+      if (payload.length > BACKUP_MAX_LENGTH) throw new Error("This class backup is too large for a practical browser link. Long learner histories or many replay events may cause this. Use the same browser's saved class or export the class CSV instead.");
+      const url = backupUrlWithoutHash();
+      url.searchParams.delete("mode");
+      url.searchParams.delete("code");
+      url.searchParams.delete("teacherPreview");
+      url.hash = `backup=${payload}`;
+      $("#backup-link-output").value = url.toString();
+      $("#backup-link-result").hidden = false;
+      status.textContent = "Encrypted link ready. Keep it private and store the two codes separately.";
+    } catch (error) {
+      status.textContent = error?.message || "Could not create the backup link.";
+    } finally {
+      button.disabled = false;
+      button.textContent = "Generate Cross-Device Link";
+    }
+  });
+  $("#copy-backup-link").addEventListener("click", async () => {
+    const output = $("#backup-link-output");
+    const status = $("#backup-link-status");
+    try {
+      await navigator.clipboard.writeText(output.value);
+      status.textContent = "Recovery link copied.";
+    } catch {
+      output.focus();
+      output.select();
+      status.textContent = "Clipboard access was blocked. The link is selected so you can copy it manually.";
+    }
+  });
   $("#lesson-history-list").addEventListener("click", (event) => {
     const button = event.target.closest("[data-recover-class]");
     const record = state.classRecords.find((item) => item.id === button?.dataset.recoverClass);
@@ -2212,4 +2354,5 @@
   if (needsFirstClassCodeSave || needsTeacherCodeSave) persist();
   if (state.view !== "explore") showView(state.view);
   updateReplayControls();
+  })();
 })();

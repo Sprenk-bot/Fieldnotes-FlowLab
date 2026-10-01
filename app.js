@@ -107,6 +107,58 @@
   const STORAGE_KEY = "fieldnotes-soil-lab-v3";
   const LEGACY_STORAGE_KEY = "fieldnotes-soil-lab-v2";
   const STUDENT_SESSION_KEY = "fieldnotes-soil-lab-student-session";
+  const STUDENT_TOKEN_KEY = "fieldnotes-soil-lab-student-token";
+  const cloudConfig = window.FLOWLAB_SUPABASE_CONFIG || {};
+  const cloudEnabled = Boolean(cloudConfig.url && cloudConfig.publishableKey && cloudConfig.functionName);
+  let cloudSaveTimer = null;
+  let cloudLastSavedAt = null;
+  let cloudSaveError = "";
+
+  async function cloudRequest(action, payload = {}) {
+    if (!cloudEnabled) throw new Error("Shared classroom storage is not configured.");
+    const response = await fetch(`${cloudConfig.url}/functions/v1/${cloudConfig.functionName}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: cloudConfig.publishableKey,
+        Authorization: `Bearer ${cloudConfig.publishableKey}`
+      },
+      body: JSON.stringify({ action, ...payload })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(result.error || `Shared class request failed (${response.status}).`);
+      error.status = response.status;
+      throw error;
+    }
+    return result;
+  }
+
+  function scheduleCloudSave() {
+    if (!cloudEnabled || !state) return;
+    clearTimeout(cloudSaveTimer);
+    cloudSaveTimer = setTimeout(async () => {
+      const record = activeClass();
+      if (!record) return;
+      try {
+        if (state.currentStudentId) {
+          const learner = currentStudent();
+          const studentToken = sessionStorage.getItem(STUDENT_TOKEN_KEY);
+          if (!learner || !studentToken) return;
+          await cloudRequest("student-save", { classCode: record.code, studentName: learner.name, studentToken, learner });
+        } else {
+          await cloudRequest("teacher-save", { classCode: record.code, teacherCode: record.teacherCode, classRecord: record });
+        }
+        cloudSaveError = "";
+        cloudLastSavedAt = new Date();
+        if (state.view === "teacher") renderTeacher();
+      } catch (error) {
+        cloudSaveError = error?.message || "Shared save did not complete.";
+        if (state.view === "teacher") renderTeacher();
+      }
+    }, 850);
+  }
+
   const AREA_M2 = 8e-4;
   const GRAPH_COLORS = ["#557d60", "#c16c51", "#7399a1"];
   const HISTORY_COLORS = ["#8167a5", "#c08a3e", "#4e8294", "#aa6475"];
@@ -214,7 +266,7 @@
       lessonIntentions: defaultLearningIntention,
       lessonDescription: "Choose three materials. Keep the setup the same and record what changes.",
       questionPrompts: questionBank.map((question) => question.prompt), workflowNotes: [...defaultWorkflowNotes],
-      published: false, classClosed: false, events: [], draftAnswers: {}, activity: null
+      published: false, publishedAt: null, publishedContent: null, classClosed: false, events: [], draftAnswers: {}, activity: null
     };
   }
   let saved = {};
@@ -245,8 +297,9 @@
   const initialActivity = initialClass.activity && typeof initialClass.activity === "object" ? initialClass.activity : saved;
   const routeParams = new URLSearchParams(window.location.search);
   const joiningFromLink = routeParams.get("mode") === "join";
+  const returningStudentSession = joiningFromLink && Boolean(sessionStorage.getItem(STUDENT_SESSION_KEY) && sessionStorage.getItem(STUDENT_TOKEN_KEY));
   const state = {
-    view: joiningFromLink ? "join" : saved.introDone ? "explore" : "intro",
+    view: joiningFromLink && !returningStudentSession ? "join" : saved.introDone ? "explore" : "intro",
     introDone: Boolean(saved.introDone),
     introStep: "spaces",
     questionPrompts: Array.isArray(initialClass.questionPrompts) && initialClass.questionPrompts.length === questionBank.length ? initialClass.questionPrompts : questionBank.map((q) => q.prompt),
@@ -274,6 +327,8 @@
     students: initialClass.students,
     events: Array.isArray(initialClass.events) ? initialClass.events.slice(-600) : Array.isArray(saved.events) ? saved.events.slice(-600) : [],
     published: Boolean(initialClass.published),
+    publishedAt: initialClass.publishedAt || null,
+    publishedContent: initialClass.publishedContent && typeof initialClass.publishedContent === "object" ? initialClass.publishedContent : null,
     lessonTitle: typeof initialClass.lessonTitle === "string" ? initialClass.lessonTitle : "Where does the water go?",
     lessonIntentions: typeof initialClass.lessonIntentions === "string" ? initialClass.lessonIntentions : defaultLearningIntention,
     lessonDescription: typeof initialClass.lessonDescription === "string" ? initialClass.lessonDescription : "Choose three materials. Keep the setup the same and record what changes.",
@@ -348,6 +403,8 @@
     record.questionPrompts = [...state.questionPrompts];
     record.workflowNotes = [...state.workflowNotes];
     record.published = state.published;
+    record.publishedAt = state.publishedAt;
+    record.publishedContent = state.publishedContent;
     record.classClosed = state.classClosed;
     record.events = state.events.slice(-600);
     record.draftAnswers = state.answers;
@@ -386,6 +443,7 @@
       currentStudentId: state.currentStudentId, className: activeClass()?.name, classCode: activeClass()?.code, teacherCode: activeClass()?.teacherCode
     };
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(copy)); } catch { /* The activity still works if storage is unavailable. */ }
+    scheduleCloudSave();
   }
 
   function escapeHtml(value) {
@@ -1246,8 +1304,13 @@
     $("#lesson-description").value = state.lessonDescription;
     $("#question-editor").value = state.questionPrompts.join("\n");
     $("#workflow-editor").value = state.workflowNotes.join("\n");
-    $("#publish-status").textContent = state.published ? "PUBLISHED · 6 PROMPTS" : "DRAFT · 6 PROMPTS";
-    $("#publish-status").classList.toggle("published", state.published);
+    const currentLessonVersion = { lessonTitle: state.lessonTitle, lessonIntentions: state.lessonIntentions, lessonDescription: state.lessonDescription, questionPrompts: state.questionPrompts, workflowNotes: state.workflowNotes };
+    const publishedLessonVersion = record.publishedContent || null;
+    const hasUnpublishedChanges = Boolean(state.published && publishedLessonVersion && JSON.stringify(currentLessonVersion) !== JSON.stringify(publishedLessonVersion));
+    const publishedLabel = state.publishedAt ? new Date(state.publishedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "previously published";
+    $("#publish-status").textContent = hasUnpublishedChanges ? `DRAFT CHANGES · students see ${publishedLabel}` : state.published ? `PUBLISHED · ${publishedLabel}` : "DRAFT · not shared with students";
+    $("#publish-status").classList.toggle("published", state.published && !hasUnpublishedChanges);
+    $("#publish-status").classList.toggle("has-draft-changes", hasUnpublishedChanges);
     $("#active-class-label").textContent = record.name;
     $("#active-class-subtitle").textContent = `${record.students.length} ${record.students.length === 1 ? "learner" : "learners"} on the list`;
     $("#join-code-display").textContent = record.code;
@@ -1264,7 +1327,7 @@
     $("#active-class-select").innerHTML = state.classRecords.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === record.id ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("");
     $("#teacher-recover-code").value = "";
     $("#teacher-recover-class-code").value = "";
-    $("#teacher-recover-status").textContent = "Both codes reopen a class saved in this browser. Cross-device recovery needs shared storage.";
+    $("#teacher-recover-status").textContent = cloudEnabled ? "Enter both codes to reopen this class from any device." : "Enter both codes to reopen a class saved in this browser.";
     $("#lesson-history-count").textContent = `${state.classRecords.length} saved ${state.classRecords.length === 1 ? "class" : "classes"}`;
     $("#lesson-history-list").innerHTML = state.classRecords.map((item) => {
       const savedActivity = item.activity || {};
@@ -1283,7 +1346,7 @@
     $("#completion-stat").textContent = `${state.students.length ? Math.round((submitted / state.students.length) * 100) : 0}%`;
     $("#completion-caption").textContent = `${submitted} of ${state.students.length} learners submitted`;
     $("#roster-count").textContent = String(state.students.length);
-    $("#class-status-caption").textContent = state.classClosed ? "Class is closed to new joins" : "Saved in this browser · roster sorted by name";
+    $("#class-status-caption").textContent = state.classClosed ? "Class is closed to new joins" : cloudSaveError ? `Shared save issue · ${cloudSaveError}` : cloudLastSavedAt ? `Shared online · saved ${cloudLastSavedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : cloudEnabled ? "Shared class storage · connecting" : "Saved in this browser · roster sorted by name";
     $("#close-class").textContent = state.classClosed ? "Reopen class" : "Close class";
     $("#roster-body").innerHTML = [...state.students].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" })).map((student) => {
       const submittedStatus = student.progress === "Submitted";
@@ -1329,6 +1392,8 @@
     state.questionPrompts = [...target.questionPrompts];
     state.workflowNotes = [...target.workflowNotes];
     state.published = Boolean(target.published);
+    state.publishedAt = target.publishedAt || null;
+    state.publishedContent = target.publishedContent && typeof target.publishedContent === "object" ? target.publishedContent : null;
     state.classClosed = Boolean(target.classClosed);
     state.events = Array.isArray(target.events) ? target.events.slice(-600) : [];
     state.answers = target.draftAnswers || {};
@@ -1361,6 +1426,8 @@
     state.questionPrompts = [...record.questionPrompts];
     state.workflowNotes = [...record.workflowNotes];
     state.published = false;
+    state.publishedAt = null;
+    state.publishedContent = null;
     state.classClosed = false;
     state.elapsed = 0;
     state.hasRun = false;
@@ -1408,6 +1475,44 @@
     activateClass(record.id);
     $("#teacher-recover-status").textContent = `${record.name} is open. Its saved lesson details and learner records are restored.`;
     return true;
+  }
+
+  function restoreSharedTeacherClass(remoteRecord, teacherCode) {
+    const code = normalizeRecoveryCode(remoteRecord?.code);
+    const existingIndex = state.classRecords.findIndex((item) => normalizeRecoveryCode(item.code) === code);
+    const existing = existingIndex >= 0 ? state.classRecords[existingIndex] : null;
+    const record = {
+      ...makeClass(remoteRecord?.name || "Class name", code, []),
+      ...remoteRecord,
+      id: remoteRecord?.id || existing?.id || createId("class"),
+      code,
+      teacherCode: normalizeRecoveryCode(teacherCode),
+      students: (Array.isArray(remoteRecord?.students) ? remoteRecord.students : []).map(normalizeStudent),
+      questionPrompts: migrateQuestionPrompts(remoteRecord?.questionPrompts),
+      workflowNotes: migrateWorkflowNotes(remoteRecord?.workflowNotes)
+    };
+    if (existingIndex >= 0) state.classRecords[existingIndex] = record;
+    else state.classRecords.push(record);
+    state.activeClassId = record.id;
+    state.currentStudentId = null;
+    state.selectedReplayStudentId = "";
+    state.students = record.students;
+    state.lessonTitle = record.lessonTitle || "Where does the water go?";
+    state.lessonIntentions = record.lessonIntentions || defaultLearningIntention;
+    state.lessonDescription = record.lessonDescription || "";
+    state.questionPrompts = [...record.questionPrompts];
+    state.workflowNotes = [...record.workflowNotes];
+    state.published = Boolean(record.published);
+    state.publishedAt = record.publishedAt || null;
+    state.publishedContent = record.publishedContent && typeof record.publishedContent === "object" ? record.publishedContent : null;
+    state.classClosed = Boolean(record.classClosed);
+    state.events = Array.isArray(record.events) ? record.events.slice(-600) : [];
+    state.answers = record.draftAnswers || {};
+    state.submitted = false;
+    applyActivitySnapshot(record.activity);
+    renderAll();
+    renderTeacher();
+    persist();
   }
 
   function renameClass(id, name) {
@@ -1999,7 +2104,7 @@
   $("#lesson-description").addEventListener("input", (event) => { state.lessonDescription = event.target.value.slice(0, 500); renderQuestions(); persist(); });
   $("#question-editor").addEventListener("input", (event) => { state.questionPrompts = event.target.value.split(/\r?\n/).slice(0, questionBank.length).map((line, index) => line.trim().slice(0, 400) || questionBank[index].prompt); persist(); });
   $("#workflow-editor").addEventListener("input", (event) => { state.workflowNotes = event.target.value.split(/\r?\n/).slice(0, defaultWorkflowNotes.length).map((line, index) => line.trim().slice(0, 300) || defaultWorkflowNotes[index]); persist(); });
-  $("#save-teacher-edits").addEventListener("click", () => { renderQuestions(); renderProgress(); persist(); showToast("Question and step wording saved in this preview."); });
+  $("#save-teacher-edits").addEventListener("click", () => { renderQuestions(); renderProgress(); persist(); showToast(cloudEnabled ? "Wording saved to this class." : "Wording saved in this browser."); });
   $("#restore-defaults").addEventListener("click", () => {
     state.questionPrompts = questionBank.map((question) => question.prompt);
     state.workflowNotes = [...defaultWorkflowNotes];
@@ -2007,18 +2112,62 @@
     $("#workflow-editor").value = state.workflowNotes.join("\n");
     renderQuestions(); persist(); showToast("Default scaffold restored.");
   });
-  $("#publish-lesson").addEventListener("click", () => {
+  $("#publish-lesson").addEventListener("click", async () => {
     state.published = true;
+    state.publishedAt = new Date().toISOString();
+    state.publishedContent = { lessonTitle: state.lessonTitle, lessonIntentions: state.lessonIntentions, lessonDescription: state.lessonDescription, questionPrompts: [...state.questionPrompts], workflowNotes: [...state.workflowNotes] };
     logEvent("lesson_published", { title: state.lessonTitle });
-    renderTeacher(); persist(); showToast("Lesson published in this preview.");
+    persist(); renderTeacher();
+    if (cloudEnabled) {
+      const button = $("#publish-lesson");
+      button.disabled = true;
+      button.textContent = "Publishing…";
+      clearTimeout(cloudSaveTimer);
+      try {
+        const record = activeClass();
+        await cloudRequest("teacher-save", { classCode: record.code, teacherCode: record.teacherCode, classRecord: record });
+        cloudSaveError = "";
+        cloudLastSavedAt = new Date();
+        renderTeacher();
+        showToast("Lesson published and shared with students.");
+      } catch (error) {
+        state.published = false;
+        state.publishedAt = null;
+        state.publishedContent = null;
+        cloudSaveError = error?.message || "The lesson could not be shared.";
+        persist();
+        renderTeacher();
+        showToast(`Lesson not published: ${cloudSaveError}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = "Publish lesson";
+        renderTeacher();
+      }
+    } else {
+      renderTeacher();
+      showToast("Lesson saved in this browser. Connect shared storage to let students join from other devices.");
+    }
   });
   $("#export-class").addEventListener("click", downloadCsv);
   $("#teacher-tour-start").addEventListener("click", () => showTeacherTour(0));
   $("#active-class-select").addEventListener("change", (event) => activateClass(event.target.value));
-  $("#teacher-recover-form").addEventListener("submit", (event) => {
+  $("#teacher-recover-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const opened = recoverTeacherClass($("#teacher-recover-class-code").value, $("#teacher-recover-code").value);
-    if (opened) showToast("Saved class reopened. Lesson details and roster restored.");
+    if (opened) { showToast("Saved class reopened. Lesson details and roster restored."); return; }
+    if (!cloudEnabled) return;
+    const classCode = normalizeRecoveryCode($("#teacher-recover-class-code").value);
+    const teacherCode = normalizeRecoveryCode($("#teacher-recover-code").value);
+    $("#teacher-recover-status").textContent = "Checking the shared class…";
+    try {
+      const result = await cloudRequest("teacher-load", { classCode, teacherCode });
+      restoreSharedTeacherClass(result.classRecord, teacherCode);
+      cloudLastSavedAt = result.updatedAt ? new Date(result.updatedAt) : new Date();
+      $("#teacher-recover-status").textContent = `${result.classRecord.name} is open. Shared lesson details and learner records are restored.`;
+      showToast("Shared class reopened on this device.");
+    } catch (error) {
+      $("#teacher-recover-status").textContent = error?.message || "Could not reopen the shared class. Check both codes and try again.";
+    }
   });
   $("#copy-teacher-recovery-code").addEventListener("click", async () => {
     try {
@@ -2250,13 +2399,56 @@
 
   // Student join is matched to a teacher-prepared name in the selected local class.
   if (joiningFromLink && routeParams.get("code")) $("#join-code").value = routeParams.get("code").toUpperCase().replace(/[^A-Z0-9]/g, "");
-  $("#join-form").addEventListener("submit", (event) => {
+  $("#join-form").addEventListener("submit", async (event) => {
     event.preventDefault(); touchActivity();
     const code = $("#join-code").value.trim().toUpperCase();
     const name = cleanStudentName($("#join-name").value);
+    if (cloudEnabled && name) {
+      $("#join-error").textContent = "Checking your class…";
+      $("#join-error").hidden = false;
+      try {
+        const result = await cloudRequest("student-load", { classCode: code, studentName: name });
+        const remote = result.classRecord;
+        const record = { ...makeClass(remote.name || "Class name", code, []), ...remote, code, teacherCode: "", students: (remote.students || []).map(normalizeStudent) };
+        state.classRecords = [record];
+        state.activeClassId = record.id;
+        state.students = record.students;
+        state.currentStudentId = record.students[0]?.id || null;
+        state.teacherPreview = routeParams.get("teacherPreview") === "1";
+        if (!state.currentStudentId) throw new Error("No learner record was returned for that roster name.");
+        sessionStorage.setItem(STUDENT_SESSION_KEY, state.currentStudentId);
+        sessionStorage.setItem(STUDENT_TOKEN_KEY, result.studentToken);
+        window.history.replaceState({}, "", `${window.location.pathname}?mode=join${state.teacherPreview ? `&teacherPreview=1&code=${encodeURIComponent(code)}` : ""}`);
+        state.lessonTitle = record.lessonTitle || "Where does the water go?";
+        state.lessonIntentions = record.lessonIntentions || defaultLearningIntention;
+        state.lessonDescription = record.lessonDescription || "";
+        state.questionPrompts = migrateQuestionPrompts(record.questionPrompts);
+        state.workflowNotes = migrateWorkflowNotes(record.workflowNotes);
+        state.published = Boolean(record.published);
+        state.classClosed = Boolean(record.classClosed);
+        state.answers = record.students[0].answers || {};
+        state.submitted = Boolean(record.students[0].submitted);
+        state.events = Array.isArray(record.students[0].events) ? record.students[0].events.slice(-600) : [];
+        applyActivitySnapshot(record.students[0].activity || record.activity);
+        logEvent("student_joined", { name: record.students[0].name });
+        $("#join-error").hidden = true;
+        persist(); renderAll(); renderTeacher(); showView("explore");
+        showToast(`Welcome back, ${record.students[0].name}. Your class is shared across devices.`);
+        return;
+      } catch (error) {
+        sessionStorage.removeItem(STUDENT_TOKEN_KEY);
+        const localMatch = !error?.status && state.classRecords.some((item) => item.code.toUpperCase() === code);
+        if (!localMatch) {
+          $("#join-error").textContent = error?.message || "Could not connect to this class. Check the code and name, then try again.";
+          $("#join-error").hidden = false;
+          return;
+        }
+      }
+    }
     const record = state.classRecords.find((item) => item.code.toUpperCase() === code);
     if (!record) { $("#join-error").textContent = "This code is not available in this browser. Check the latest student link or code. Cross-device joining needs shared class storage, which is not connected in this preview yet."; $("#join-error").hidden = false; return; }
     if (record.classClosed) { $("#join-error").textContent = "This class is closed. Please ask your teacher for help."; $("#join-error").hidden = false; return; }
+    if (!record.published) { $("#join-error").textContent = "Your teacher has not published this lesson yet."; $("#join-error").hidden = false; return; }
     if (!name) { $("#join-error").textContent = "Please enter your first, or first and last name"; $("#join-error").hidden = false; return; }
     if (record.id !== state.activeClassId) activateClass(record.id);
     const needle = name.toLocaleLowerCase();
@@ -2266,6 +2458,12 @@
     if (!existing) { $("#join-error").textContent = "Please enter your first, or first and last name"; $("#join-error").hidden = false; return; }
     $("#join-error").hidden = true;
     state.currentStudentId = existing.id;
+    const learnerLesson = record.publishedContent || record;
+    state.lessonTitle = learnerLesson.lessonTitle || state.lessonTitle;
+    state.lessonIntentions = learnerLesson.lessonIntentions || state.lessonIntentions;
+    state.lessonDescription = learnerLesson.lessonDescription || state.lessonDescription;
+    state.questionPrompts = migrateQuestionPrompts(learnerLesson.questionPrompts);
+    state.workflowNotes = migrateWorkflowNotes(learnerLesson.workflowNotes);
     sessionStorage.setItem(STUDENT_SESSION_KEY, existing.id);
     window.history.replaceState({}, "", `${window.location.pathname}?mode=join`);
     if (state.teacherPreview) {
@@ -2288,7 +2486,7 @@
   $("#what-is-darcy").addEventListener("click", () => openDialog("What makes water move?", `<p>Water moves through a porous material when there is a difference in water pressure. In this activity, the water head creates that push.</p><p><strong>Darcy’s law</strong> connects the material’s hydraulic conductivity (K), the sample area, and the pressure gradient (head difference ÷ sample length) to the discharge (Q).</p><p>On the graph, Q appears as the <strong>slope</strong>: a steeper line means more water is moving each second. If you change one setting at a time, you can see which part of the setup changed that slope.</p>`));
   $("#formula-help").addEventListener("click", () => openDialog("What do these numbers mean?", `<p><strong>K</strong> describes how readily the material transmits water. <strong>A</strong> is the sample’s cross-sectional area (0.0008 m²). <strong>Δh</strong> is the water head, and <strong>L</strong> is the sample depth.</p><p>The model uses Q = K × A × (Δh ÷ L). Porosity is displayed separately because more pore space does not automatically mean faster flow.</p>`));
   $("#why-slow").addEventListener("click", () => openDialog("Why might this sample flow slowly?", `<p>Water pathways depend on pore size and how well those pores connect. Clay can have a high total fraction of pore space but tiny pores that resist flow.</p><p>The animation is a teaching illustration. It does not model individual water molecules or claim to be a physical-scale experiment.</p>`));
-  $("#about-model").addEventListener("click", () => openDialog("About this classroom model", `<p>Flow is calculated with Darcy’s law, using one representative hydraulic conductivity for each material. Porosity is an independent material property.</p><p>Compaction reduces effective porosity and conductivity using a simplified teaching curve. Natural soils and rocks vary widely; see the Material Library for source notes and limitations.</p><p>This interactive is a browser-only classroom preview. Its sample roster, lesson and activity history stay on this device.</p>`));
+  $("#about-model").addEventListener("click", () => openDialog("About this classroom model", `<p>Flow is calculated with Darcy’s law, using one representative hydraulic conductivity for each material. Porosity is an independent material property.</p><p>Compaction reduces effective porosity and conductivity using a simplified teaching curve. Natural soils and rocks vary widely; see the Material Library for source notes and limitations.</p><p>When shared classroom storage is available, class names, roster names, lesson settings, learner answers and investigation activity are saved to Supabase so the teacher and students can use the class across devices. Keep class and teacher recovery codes private, and remove class data when it is no longer needed.</p>`));
   document.addEventListener("click", (event) => {
     const term = event.target.closest("[data-glossary]");
     if (!term) return;

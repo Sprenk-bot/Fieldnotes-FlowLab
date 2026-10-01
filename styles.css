@@ -1114,6 +1114,9 @@ input[type="range"] { height: 20px; margin-top: 5px; }
 .header-join-button:hover { background: #e8f0e5; }
 .header-join-button:focus-visible { outline: 3px solid rgba(92, 139, 104, .35); outline-offset: 2px; }
 .footer-credit { color: #929d94; font-size: 11px; }
+.draft-status.published { color: #37684b; background: #e8f2e9; }
+.draft-status.has-draft-changes { color: #9a6419; background: #fbf0db; }
+.footer-credit { max-width: min(52vw, 560px); text-align: center; line-height: 1.45; }
 [hidden] { display: none !important; }
 
 /* Comparisons read top-to-bottom and the panel grows to fit all samples. */

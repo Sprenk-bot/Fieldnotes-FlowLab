@@ -372,8 +372,6 @@
     $("#contrast-setting").value = accessibilitySettings.theme;
     $("#motion-setting").checked = accessibilitySettings.reduceMotion;
   }
-  const defaultStepTitles = ["Predict", "Keep it fair", "Read the graph", "Explain & evaluate"];
-  const defaultStepQuestionLinks = [["q1"], ["q2"], ["q3"], ["q4", "q5", "q6"]];
   function normalizeLessonQuestions(questions, legacyPrompts) {
     const source = Array.isArray(questions) ? questions : questionBank.map((question, index) => ({ ...question, prompt: migrateQuestionPrompts(legacyPrompts)[index] || question.prompt }));
     const seen = new Set();
@@ -386,7 +384,9 @@
     });
   }
   function defaultWorkflowSteps(notes = defaultWorkflowNotes) {
-    return defaultStepTitles.map((title, index) => ({ id: `step-${index + 1}`, title, note: notes[index] || defaultWorkflowNotes[index], requiredQuestionIds: defaultStepQuestionLinks[index], requireThreeTests: index === 1 || index === 2, manual: false }));
+    const titles = ["Predict", "Keep it fair", "Read the graph", "Explain & evaluate"];
+    const questionLinks = [["q1"], ["q2"], ["q3"], ["q4", "q5", "q6"]];
+    return titles.map((title, index) => ({ id: `step-${index + 1}`, title, note: notes[index] || defaultWorkflowNotes[index], requiredQuestionIds: questionLinks[index], requireThreeTests: index === 1 || index === 2, manual: false }));
   }
   function normalizeWorkflowSteps(steps, legacyNotes) {
     if (!Array.isArray(steps)) return defaultWorkflowSteps(migrateWorkflowNotes(legacyNotes));

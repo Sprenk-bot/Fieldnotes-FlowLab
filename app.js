@@ -108,11 +108,14 @@
   const LEGACY_STORAGE_KEY = "fieldnotes-soil-lab-v2";
   const STUDENT_SESSION_KEY = "fieldnotes-soil-lab-student-session";
   const STUDENT_TOKEN_KEY = "fieldnotes-soil-lab-student-token";
+  const ROLE_SESSION_KEY = "fieldnotes-flowlab-role";
+  const VIEW_SESSION_KEY = "fieldnotes-flowlab-view";
   const cloudConfig = window.FLOWLAB_SUPABASE_CONFIG || {};
   const cloudEnabled = Boolean(cloudConfig.url && cloudConfig.publishableKey && cloudConfig.functionName);
   let cloudSaveTimer = null;
   let cloudLastSavedAt = null;
   let cloudSaveError = "";
+  let unsavedWork = false;
 
   async function cloudRequest(action, payload = {}) {
     if (!cloudEnabled) throw new Error("Shared classroom storage is not configured.");
@@ -135,9 +138,10 @@
   }
 
   function scheduleCloudSave() {
-    if (!cloudEnabled || !state) return;
+    if (!cloudEnabled || !state || state.userRole === "guest") return;
     clearTimeout(cloudSaveTimer);
     cloudSaveTimer = setTimeout(async () => {
+      if (state.userRole === "guest") return;
       const record = activeClass();
       if (!record) return;
       try {
@@ -177,7 +181,41 @@
     { id: "granite", label: "Granite", category: "Rock", k: 1e-9, porosity: 4, grain: "Dense rock; fractures matter", grainRadius: 2.4, color: "#879594", sensitivity: 0.47, note: "Intact granite has little connected pore space; fractures change its flow." },
     { id: "sandstone", label: "Sandstone", category: "Rock", k: 1e-6, porosity: 18, grain: "Grains cemented together", grainRadius: 2.1, color: "#aa8c70", sensitivity: 0.53, note: "Cement and fractures make sandstone samples very different." }
   ];
+  const builtInMaterials = [...materials];
+  const builtInMaterialIds = new Set(builtInMaterials.map((item) => item.id));
   const materialById = Object.fromEntries(materials.map((item) => [item.id, item]));
+  function normalizeCustomMaterials(input) {
+    if (!Array.isArray(input)) return [];
+    const usedIds = new Set(builtInMaterialIds);
+    const usedNames = new Set(builtInMaterials.map((item) => item.label.toLocaleLowerCase()));
+    return input.slice(0, 60).flatMap((source, index) => {
+      const label = String(source?.label || "").trim().replace(/\s+/g, " ").slice(0, 60);
+      const k = Number(source?.k);
+      const porosity = Number(source?.porosity);
+      if (!label || usedNames.has(label.toLocaleLowerCase()) || !Number.isFinite(k) || k <= 0 || k > 0.1 || !Number.isFinite(porosity) || porosity < 0 || porosity > 100) return [];
+      let id = String(source?.id || `custom-${label.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-")}-${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 80);
+      if (!id.startsWith("custom-") || usedIds.has(id)) id = `custom-${createId("material")}`;
+      usedIds.add(id);
+      usedNames.add(label.toLocaleLowerCase());
+      const color = /^#[0-9a-f]{6}$/i.test(String(source?.color || "")) ? String(source.color) : "#597b66";
+      return [{
+        id, label, category: String(source?.category || "Custom material").trim().slice(0, 40),
+        k, porosity: Math.round(porosity), grain: String(source?.grain || "Custom model inputs").trim().slice(0, 80),
+        grainRadius: Math.max(1.2, Math.min(5.5, 1.2 + porosity / 18)), color, sensitivity: 0.65,
+        note: String(source?.note || "Teacher-added model material. Check its source and how closely it matches a real sample.").trim().slice(0, 220), custom: true
+      }];
+    });
+  }
+  function setCustomMaterials(input) {
+    const custom = normalizeCustomMaterials(input);
+    for (const id of Object.keys(materialById)) if (!builtInMaterialIds.has(id)) delete materialById[id];
+    materials.splice(0, materials.length, ...builtInMaterials, ...custom);
+    custom.forEach((material) => { materialById[material.id] = material; });
+    state.customMaterials = custom;
+    if (!materialById[state.selected]) state.selected = "gravel";
+    state.comparison = state.comparison.filter((id) => Boolean(materialById[id]) && id !== state.selected);
+    return custom;
+  }
   const questionBank = [
     { id: "q1", stage: "PREDICT", prompt: "Before you run anything: which of your three materials do you predict will pass water fastest? Give one reason from the particle picture or material note.", hint: "Start with: I predict ___ because I can see…" },
     { id: "q2", stage: "PLAN A FAIR TEST", prompt: "What will you keep the same while you compare materials? Why does that make the comparison fair?", hint: "Think about water head, sample depth and compaction." },
@@ -268,7 +306,7 @@
       lessonDescription: "Choose three materials. Keep the setup the same and record what changes.",
       questions: normalizeLessonQuestions(null, null), workflowSteps: defaultWorkflowSteps(),
       questionPrompts: questionBank.map((question) => question.prompt), workflowNotes: [...defaultWorkflowNotes],
-      published: false, publishedAt: null, publishedContent: null, classClosed: false, events: [], draftAnswers: {}, activity: null
+      published: false, publishedAt: null, publishedContent: null, classClosed: false, events: [], draftAnswers: {}, activity: null, customMaterials: []
     };
   }
   let saved = {};
@@ -282,7 +320,7 @@
   const storedClasses = Array.isArray(saved.classes) ? saved.classes.filter((item) => item && typeof item === "object").map((item) => {
     const fresh = makeClass(item.name, item.code, []);
     const savedName = String(item.name || fresh.name).trim().replace(/\s+/g, " ").slice(0, 80);
-    return { ...fresh, ...item, id: item.id || fresh.id, name: savedName === "Water & the land" ? "Class name" : savedName, code: String(item.code || fresh.code).toUpperCase(), teacherCode: String(item.teacherCode || fresh.teacherCode).toUpperCase(), lessonIntentions: String(item.lessonIntentions || defaultLearningIntention), students: (Array.isArray(item.students) ? item.students : []).map(normalizeStudent), questions: normalizeLessonQuestions(item.questions, item.questionPrompts), workflowSteps: normalizeWorkflowSteps(item.workflowSteps, item.workflowNotes), publishedContent: item.publishedContent && typeof item.publishedContent === "object" ? { ...item.publishedContent, questions: normalizeLessonQuestions(item.publishedContent.questions, item.publishedContent.questionPrompts || item.questionPrompts), workflowSteps: normalizeWorkflowSteps(item.publishedContent.workflowSteps, item.publishedContent.workflowNotes || item.workflowNotes) } : null, questionPrompts: migrateQuestionPrompts(item.questionPrompts || fresh.questionPrompts), workflowNotes: migrateWorkflowNotes(item.workflowNotes || fresh.workflowNotes) };
+    return { ...fresh, ...item, id: item.id || fresh.id, name: savedName === "Water & the land" ? "Class name" : savedName, code: String(item.code || fresh.code).toUpperCase(), teacherCode: String(item.teacherCode || fresh.teacherCode).toUpperCase(), lessonIntentions: String(item.lessonIntentions || defaultLearningIntention), students: (Array.isArray(item.students) ? item.students : []).map(normalizeStudent), questions: normalizeLessonQuestions(item.questions, item.questionPrompts), workflowSteps: normalizeWorkflowSteps(item.workflowSteps, item.workflowNotes), customMaterials: normalizeCustomMaterials(item.customMaterials), publishedContent: item.publishedContent && typeof item.publishedContent === "object" ? { ...item.publishedContent, questions: normalizeLessonQuestions(item.publishedContent.questions, item.publishedContent.questionPrompts || item.questionPrompts), workflowSteps: normalizeWorkflowSteps(item.publishedContent.workflowSteps, item.publishedContent.workflowNotes || item.workflowNotes), customMaterials: normalizeCustomMaterials(item.publishedContent.customMaterials) } : null, questionPrompts: migrateQuestionPrompts(item.questionPrompts || fresh.questionPrompts), workflowNotes: migrateWorkflowNotes(item.workflowNotes || fresh.workflowNotes) };
   }) : [];
   const needsFirstClassCodeSave = !storedClasses.length && !saved.classCode;
   const needsTeacherCodeSave = storedClasses.length ? storedClasses.some((item) => !item.teacherCode) : !saved.teacherCode;
@@ -303,22 +341,38 @@
   const returningStudentSession = joiningFromLink && Boolean(sessionStorage.getItem(STUDENT_SESSION_KEY) && sessionStorage.getItem(STUDENT_TOKEN_KEY));
   const ACCESSIBILITY_KEY = "fieldnotes-accessibility-v1";
   const LIBRARY_MODE_KEY = "fieldnotes-library-mode-v1";
-  let accessibilitySettings = { textScale: 1, theme: "default", reduceMotion: false };
+  let accessibilitySettings = { textScale: 1, theme: "default", readingFont: "standard", chartPalette: "standard", reduceMotion: false };
   try {
     const savedSettings = JSON.parse(localStorage.getItem(ACCESSIBILITY_KEY) || "{}");
     accessibilitySettings = {
       textScale: [1, 1.1, 1.2].includes(Number(savedSettings.textScale)) ? Number(savedSettings.textScale) : 1,
-      theme: ["default", "contrast", "dark"].includes(savedSettings.theme) ? savedSettings.theme : "default",
+      theme: ["default", "simple", "contrast", "dark"].includes(savedSettings.theme) ? savedSettings.theme : "default",
+      readingFont: savedSettings.readingFont === "clear" ? "clear" : "standard",
+      chartPalette: savedSettings.chartPalette === "color-safe" ? "color-safe" : "standard",
       reduceMotion: Boolean(savedSettings.reduceMotion)
     };
   } catch { /* Use the standard display settings. */ }
   let libraryMode = localStorage.getItem(LIBRARY_MODE_KEY) === "advanced" ? "advanced" : "simple";
+  const storedRole = sessionStorage.getItem(ROLE_SESSION_KEY);
+  const entryRole = ['teacher', 'student', 'guest'].includes(storedRole) ? storedRole : '';
+  const storedView = sessionStorage.getItem(VIEW_SESSION_KEY);
+  const roleAllowsView = (role, view) => {
+    if (!view || !["entry", "intro", "explore", "lesson", "teacher", "sources", "accessibility", "join"].includes(view)) return false;
+    if (role === "guest") return ["intro", "explore", "sources", "accessibility"].includes(view);
+    if (role === "teacher") return view !== "join" && view !== "entry";
+    if (role === "student") return view !== "teacher" && view !== "entry";
+    return view === "entry";
+  };
+  const initialRole = joiningFromLink ? "student" : entryRole;
+  const initialView = joiningFromLink && !returningStudentSession ? "join" : roleAllowsView(initialRole, storedView) ? storedView : entryRole === "guest" ? "intro" : entryRole ? (saved.introDone ? "explore" : "intro") : "entry";
   const state = {
-    view: joiningFromLink && !returningStudentSession ? "join" : saved.introDone ? "explore" : "intro",
+    view: initialView,
+    userRole: joiningFromLink ? "student" : entryRole || "guest",
     introDone: Boolean(saved.introDone),
     introStep: "spaces",
     questions: normalizeLessonQuestions(initialClass.questions, initialClass.questionPrompts),
     workflowSteps: normalizeWorkflowSteps(initialClass.workflowSteps, initialClass.workflowNotes),
+    customMaterials: joiningFromLink || entryRole === "guest" ? [] : normalizeCustomMaterials(initialClass.customMaterials),
     completedWorkflowSteps: Array.isArray(initialClass.completedWorkflowSteps) ? initialClass.completedWorkflowSteps.map(String) : [],
     questionPrompts: Array.isArray(initialClass.questionPrompts) ? initialClass.questionPrompts : questionBank.map((q) => q.prompt),
     workflowNotes: Array.isArray(initialClass.workflowNotes) ? initialClass.workflowNotes : defaultWorkflowNotes,
@@ -355,7 +409,7 @@
     classRecords,
     activeClassId,
     currentStudentId: joiningFromLink && typeof sessionStorage.getItem(STUDENT_SESSION_KEY) === "string" && initialClass.students.some((student) => student.id === sessionStorage.getItem(STUDENT_SESSION_KEY)) ? sessionStorage.getItem(STUDENT_SESSION_KEY) : null,
-    teacherPreview: joiningFromLink && routeParams.get("teacherPreview") === "1",
+    teacherPreview: joiningFromLink && routeParams.get("teacherPreview") === "1" && entryRole === "teacher",
     selectedReplayStudentId: "",
     idle: false,
     lastActivity: Date.now()
@@ -364,12 +418,71 @@
   function lessonWorkflowSteps() { return state.workflowSteps; }
   function activeClass() { return state.classRecords.find((item) => item.id === state.activeClassId) || state.classRecords[0]; }
   function currentStudent() { return state.students.find((student) => student.id === state.currentStudentId) || null; }
+  setCustomMaterials(state.customMaterials);
+  if (materialById[initialActivity.selected]) state.selected = initialActivity.selected;
+  state.comparison = Array.isArray(initialActivity.comparison) ? initialActivity.comparison.filter((id) => materialById[id] && id !== state.selected).slice(0, 2) : [];
+  let guestClassId = "";
+  let preGuestClassId = "";
+  function endGuestSession() {
+    if (!guestClassId) return;
+    const wasGuestActive = state.activeClassId === guestClassId;
+    state.classRecords = state.classRecords.filter((record) => record.id !== guestClassId);
+    guestClassId = "";
+    if (wasGuestActive) {
+      const previous = state.classRecords.find((record) => record.id === preGuestClassId) || state.classRecords[0];
+      if (previous) activateClass(previous.id);
+    }
+    preGuestClassId = "";
+  }
+  function beginGuestSession() {
+    clearTimeout(cloudSaveTimer);
+    endGuestSession();
+    preGuestClassId = state.activeClassId;
+    const guest = makeClass("Guest session", generateUniqueClassCode(), []);
+    state.classRecords.push(guest);
+    guestClassId = guest.id;
+    state.userRole = "guest";
+    state.activeClassId = guest.id;
+    state.currentStudentId = null;
+    state.selectedReplayStudentId = "";
+    state.students = [];
+    state.answers = {};
+    state.submitted = false;
+    state.submittedAt = null;
+    state.events = [];
+    state.completedWorkflowSteps = [];
+    state.introDone = false;
+    state.lessonTitle = guest.lessonTitle;
+    state.lessonIntentions = guest.lessonIntentions;
+    state.lessonDescription = guest.lessonDescription;
+    state.questions = normalizeLessonQuestions(guest.questions, guest.questionPrompts);
+    state.workflowSteps = normalizeWorkflowSteps(guest.workflowSteps, guest.workflowNotes);
+    setCustomMaterials([]);
+    state.published = false;
+    state.classClosed = false;
+    state.selected = "gravel";
+    state.comparison = [];
+    state.headCm = 15;
+    state.depthCm = 10;
+    state.compaction = 0;
+    state.elapsed = 0;
+    state.hasRun = false;
+    state.series = {};
+    state.history = [];
+    state.historyOverlays = [];
+    state.completedMaterials = new Set();
+    state.mode = "simple";
+  }
+  if (entryRole === "guest" && !joiningFromLink) beginGuestSession();
   function applyAccessibilitySettings() {
     document.documentElement.dataset.theme = accessibilitySettings.theme;
     document.documentElement.dataset.reduceMotion = String(accessibilitySettings.reduceMotion);
+    document.documentElement.dataset.readingFont = accessibilitySettings.readingFont || "standard";
     document.documentElement.style.setProperty("--user-zoom", String(accessibilitySettings.textScale));
     $("#text-size-setting").value = String(accessibilitySettings.textScale);
     $("#contrast-setting").value = accessibilitySettings.theme;
+    $("#reading-font-setting").value = accessibilitySettings.readingFont || "standard";
+    $("#chart-palette-setting").value = accessibilitySettings.chartPalette || "standard";
     $("#motion-setting").checked = accessibilitySettings.reduceMotion;
   }
   function normalizeLessonQuestions(questions, legacyPrompts) {
@@ -413,22 +526,38 @@
   }
   function renderStudentAccess() {
     const student = currentStudent();
-    $("#header-view-identity").textContent = student?.name || (state.view === "join" ? "Join your class" : "Teacher View");
+    const isEntry = state.view === "entry";
+    const isJoin = state.view === "join" && !student;
+    const isGate = isEntry || isJoin;
+    const isTeacher = state.userRole === "teacher" && !student;
+    const isGuest = state.userRole === "guest" && !student;
+    $(".app-frame").classList.toggle("entry-mode", isGate);
+    $("#header-view-identity").textContent = isEntry ? "Choose a workspace" : student?.name || (isJoin ? "Join your class" : isGuest ? "Guest View" : "Teacher View");
     $("#header-class-code").textContent = activeClass()?.code || "—";
-    $("#topbar-class-name").textContent = activeClass()?.name || "Fieldnotes";
+    $("#topbar-class-name").textContent = isTeacher || student ? activeClass()?.name || "Fieldnotes" : isGate ? "Welcome" : "FlowLab";
     const joinUrl = studentJoinUrl();
     const link = $("#header-student-url");
     link.href = joinUrl.href;
     $("#header-student-url-text").textContent = joinUrl.href;
     link.title = joinUrl.href;
     const isStudent = Boolean(student) || state.view === "join";
-    $("[data-view='teacher']").hidden = isStudent;
+    $("[data-view='teacher']").hidden = !isTeacher;
+    $("[data-view='lesson']").hidden = isGuest || isGate;
+    $("[data-view='intro']").hidden = isGate;
+    $("[data-view='explore']").hidden = isGate;
+    $("[data-view='sources']").hidden = isGate;
+    $("[data-view='accessibility']").hidden = isGate;
+    $(".nav-label").hidden = isGate;
+    $(".workspace-guide").hidden = isGuest || isGate;
+    $("#change-role").hidden = isGate;
+    $(".header-class-code").hidden = !(isTeacher || student);
     const joinShortcut = $(".join-shortcut");
     if (joinShortcut) joinShortcut.hidden = isStudent;
-    $(".header-join-button").hidden = isStudent;
-    link.hidden = isStudent;
-    $("#header-qr-code").hidden = isStudent;
+    $(".header-join-button").hidden = !isTeacher || isGate;
+    link.hidden = !isTeacher || isGate;
+    $("#header-qr-code").hidden = !isTeacher || isGate;
     $("#return-teacher-view").hidden = !(isStudent && state.teacherPreview);
+    $("#footer-class-name").textContent = isTeacher || student ? activeClass()?.name || "Class name" : isGate ? "Welcome" : "Guest session";
   }
   if (state.currentStudentId) {
     const returningLearner = currentStudent();
@@ -464,6 +593,7 @@
     record.lessonDescription = state.lessonDescription;
     record.questions = structuredCloneSafe(state.questions);
     record.workflowSteps = structuredCloneSafe(state.workflowSteps);
+    record.customMaterials = structuredCloneSafe(state.customMaterials);
     record.questionPrompts = state.questions.map((question) => question.prompt);
     record.workflowNotes = state.workflowSteps.map((step) => step.note);
     record.published = state.published;
@@ -493,6 +623,7 @@
   }
 
   function persist() {
+    if (state.userRole === "guest") return;
     captureClassState();
     const copy = {
       mode: state.mode, selected: state.selected, headCm: state.headCm,
@@ -500,7 +631,7 @@
       comparison: state.comparison, elapsed: state.elapsed, hasRun: state.hasRun,
       series: state.series, history: state.history, historyOverlays: state.historyOverlays, completedMaterials: Array.from(state.completedMaterials),
       answers: state.answers, submitted: state.submitted, submittedAt: state.submittedAt, students: state.students,
-      introDone: state.introDone, questions: state.questions, workflowSteps: state.workflowSteps,
+      introDone: state.introDone, questions: state.questions, workflowSteps: state.workflowSteps, customMaterials: state.customMaterials,
       questionPrompts: state.questions.map((question) => question.prompt), workflowNotes: state.workflowSteps.map((step) => step.note),
       grainModel: state.grainModel, pathModel: state.pathModel,
       events: state.events.slice(-600), published: state.published,
@@ -518,6 +649,12 @@
   }
 
   function getMaterial(id = state.selected) { return materialById[id] || materialById.clay; }
+  function materialPlotColor(id, index = 0) {
+    const material = getMaterial(id);
+    if (material.custom) return material.color;
+    const palette = accessibilitySettings.chartPalette === "color-safe" ? ["#0072B2", "#D55E00", "#009E73"] : GRAPH_COLORS;
+    return palette[(index + palette.length) % palette.length];
+  }
   function activeMaterialIds() { return [state.selected, ...state.comparison].filter((id, index, list) => list.indexOf(id) === index); }
   function materialIllustration(material, decorative = false) {
     const label = `${material.label} material illustration`;
@@ -546,6 +683,14 @@
     } else if (material.id === "sandstone") {
       texture = `<path d="M8 18 22 9l19 4 17-6 17 8 24-2 13 10-3 27-19 10-17-4-17 5-18-6-18 3-11-17Z" fill="#c49b74" stroke="#9b7758" stroke-width="1.4"/><path d="M13 24c18-5 33 5 49 0s31 4 49-1M12 42c16-4 29 3 43 0s31 4 55-1" fill="none" stroke="#e0bd91" stroke-width="2" opacity=".85"/>`;
       for(let i=0;i<38;i+=1){const x=13+((i*29+3)%95),y=17+((i*17+4)%43);texture+=`<circle cx="${x}" cy="${y}" r="${1+(i%3)*.45}" fill="${i%2?"#8e6e54":"#e4c59d"}" opacity=".8"/>`;}
+    } else if (material.custom) {
+      const seed = material.id.split("").reduce((sum, char) => sum + char.charCodeAt(0), 0);
+      const count = Math.max(24, Math.min(90, Math.round(118 - material.grainRadius * 13)));
+      for (let i = 0; i < count; i += 1) {
+        const x = 8 + ((i * 37 + seed) % 104), y = 8 + ((i * 23 + seed * 2) % 56);
+        const radius = Math.max(0.7, material.grainRadius * (0.24 + (i % 4) * 0.07));
+        texture += `<circle cx="${x}" cy="${y}" r="${radius.toFixed(1)}" fill="${material.color}" opacity="${i % 3 === 0 ? ".66" : ".9"}"/>`;
+      }
     }
     const accessible = decorative ? "aria-hidden=\"true\" focusable=\"false\"" : `role=\"img\" aria-label=\"${escapeHtml(label)}\"`;
     return `<svg viewBox="0 0 120 72" ${accessible}><title>${escapeHtml(label)}</title><rect x="1" y="1" width="118" height="70" rx="9" fill="${material.id === "granite" ? "#dfe3df" : material.id === "laterite" ? "#ead6c3" : "#f0eadb"}"/>${texture}<rect x="1" y="1" width="118" height="70" rx="9" fill="none" stroke="#d9d7cb"/></svg>`;
@@ -880,10 +1025,7 @@
   function renderMaterialOptions() {
     const select = $("#material-select");
     const compare = $("#compare-select");
-    if (!select.dataset.ready) {
-      select.innerHTML = materials.map((m) => `<option value="${m.id}">${escapeHtml(m.label)} · ${escapeHtml(m.category)}</option>`).join("");
-      select.dataset.ready = "true";
-    }
+    select.innerHTML = materials.map((m) => `<option value="${m.id}">${escapeHtml(m.label)} · ${escapeHtml(m.category)}</option>`).join("");
     select.value = state.selected;
     const available = materials.filter((m) => m.id !== state.selected && !state.comparison.includes(m.id));
     const previous = compare.value;
@@ -897,7 +1039,7 @@
     const target = $("#compare-chips");
     target.innerHTML = state.comparison.map((id) => {
       const material = getMaterial(id);
-      const color = GRAPH_COLORS[activeMaterialIds().indexOf(id) % GRAPH_COLORS.length];
+      const color = materialPlotColor(id, activeMaterialIds().indexOf(id));
       return `<span class="compare-chip"><i class="legend-dot" style="background:${color}"></i>${escapeHtml(material.label)}<button type="button" data-remove-compare="${id}" aria-label="Remove ${escapeHtml(material.label)} from comparison">×</button></span>`;
     }).join("");
   }
@@ -937,7 +1079,7 @@
       const kPower = Math.floor(Math.log10(h.k));
       const permeabilityBand = kPower <= -7 ? "Very low" : kPower <= -5 ? "Low" : kPower <= -3 ? "Moderate" : "High";
       const permeabilityPercent = ({ "Very low": 12.5, Low: 37.5, Moderate: 62.5, High: 87.5 })[permeabilityBand];
-      const color = GRAPH_COLORS[activeMaterialIds().indexOf(id) % GRAPH_COLORS.length];
+      const color = materialPlotColor(id, activeMaterialIds().indexOf(id));
       return `<article class="compare-property-card" style="--sample-color:${color}"><strong class="compare-property-name"><i></i>${escapeHtml(material.label)}</strong><div class="compare-property-meter"><span>Porosity <b>${porosity.toFixed(0)}% of volume</b></span><div class="model-meter" role="meter" aria-label="${escapeHtml(material.label)} modelled porosity, percentage of total volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${porosity.toFixed(1)}"><i style="width:${porePercent}%"></i></div></div><div class="compare-property-meter"><span>Permeability <b>${permeabilityBand}</b></span><div class="model-meter permeability-meter" role="meter" aria-label="${escapeHtml(material.label)} illustrative permeability category" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${permeabilityPercent.toFixed(0)}"><i style="width:${permeabilityPercent}%"></i></div><small class="meter-scale-ends"><span>Very low</span><span>High</span></small></div></article>`;
     }).join("");
   }
@@ -1053,7 +1195,7 @@
       }).join("") : "";
       const stream = state.hasRun ? `<path d="M84 17V84" fill="none" stroke="#6ca6ac" stroke-width="1.5" stroke-dasharray="2 4" opacity=".72"/>` : "";
       const collectedY = 98 + ((time * speed * 14 + index * 3) % 8);
-      return `<article class="sample-mini"><div class="sample-mini-head"><span class="sample-index" style="--sample-color:${GRAPH_COLORS[index % GRAPH_COLORS.length]}">${index + 1}</span><strong>${escapeHtml(material.label)}</strong></div><svg viewBox="0 0 150 112" role="img" aria-label="${escapeHtml(material.label)} grains with ${flow.toLowerCase()} model flow"><title>${escapeHtml(material.label)} simulated sample</title><rect x="49" y="13" width="70" height="78" rx="7" fill="#fffefa" stroke="#98a998" stroke-width="2"/><path d="M55 22h58v62H55z" fill="#f2efe4"/>${stream}${grains}${drops}<path d="M74 95h20" stroke="#78978f" stroke-width="3" stroke-linecap="round"/><path d="M84 91v8" stroke="#6ca6ac" stroke-width="2"/>${state.hasRun ? `<circle cx="84" cy="${collectedY.toFixed(1)}" r="2.6" fill="#5499a2"/>` : ""}<text x="84" y="109" text-anchor="middle" fill="#75847a" font-size="8" font-family="DM Sans, sans-serif">${escapeHtml(flow.toUpperCase())}</text></svg><div class="sample-mini-foot"><span>Porosity ${effectivePorosity(material).toFixed(0)}%</span><span>${escapeHtml(material.note)}</span></div></article>`;
+      return `<article class="sample-mini"><div class="sample-mini-head"><span class="sample-index" style="--sample-color:${materialPlotColor(material.id, index)}">${index + 1}</span><strong>${escapeHtml(material.label)}</strong></div><svg viewBox="0 0 150 112" role="img" aria-label="${escapeHtml(material.label)} grains with ${flow.toLowerCase()} model flow"><title>${escapeHtml(material.label)} simulated sample</title><rect x="49" y="13" width="70" height="78" rx="7" fill="#fffefa" stroke="#98a998" stroke-width="2"/><path d="M55 22h58v62H55z" fill="#f2efe4"/>${stream}${grains}${drops}<path d="M74 95h20" stroke="#78978f" stroke-width="3" stroke-linecap="round"/><path d="M84 91v8" stroke="#6ca6ac" stroke-width="2"/>${state.hasRun ? `<circle cx="84" cy="${collectedY.toFixed(1)}" r="2.6" fill="#5499a2"/>` : ""}<text x="84" y="109" text-anchor="middle" fill="#75847a" font-size="8" font-family="DM Sans, sans-serif">${escapeHtml(flow.toUpperCase())}</text></svg><div class="sample-mini-foot"><span>Porosity ${effectivePorosity(material).toFixed(0)}%</span><span>${escapeHtml(material.note)}</span></div></article>`;
     }).join("")}</div>`;
   }
 
@@ -1134,7 +1276,7 @@
       const expected = Math.max(.00001, qMlMin / 60 * horizon);
       const fill = hasRun ? Math.min(10, Math.max(1, (volume / expected) * 10)) : 0;
       const fillY = 149 - fill;
-      return `<article class="sample-mini"><div class="sample-mini-head"><span class="sample-index" style="--sample-color:${GRAPH_COLORS[index % GRAPH_COLORS.length]}">${index + 1}</span><strong>${escapeHtml(material.label)}</strong><span class="sample-flow-pill">${flow}</span></div><svg viewBox="0 0 180 150" role="img" aria-label="${escapeHtml(material.label)}: ${porosity.toFixed(0)} percent pore space, ${formatVolume(volume)} millilitres collected"><title>${escapeHtml(material.label)} simulated flow sample</title><path d="M84 6v17" stroke="#72948a" stroke-width="4"/><rect x="45" y="19" width="78" height="110" rx="7" fill="#fffefa" stroke="#809686" stroke-width="2.5"/><path d="M52 28h64v91H52z" fill="#f2ede0"/><path d="M84 29v88" stroke="#65a0a5" stroke-width="2" stroke-dasharray="4 5" opacity=".72"/>${grains}${drops}<path d="M84 129v9" stroke="#73968f" stroke-width="4"/><rect x="68" y="137" width="32" height="12" rx="3" fill="#fffefa" stroke="#92a394" stroke-width="1.5"/><rect x="70" y="${fillY}" width="28" height="${fill}" rx="2" fill="#79b4b8" opacity=".9"/><text x="84" y="14" text-anchor="middle" font-family="DM Sans,sans-serif" font-size="9" fill="#6f8276">WATER</text><text x="84" y="148" text-anchor="middle" font-family="DM Sans,sans-serif" font-size="7" fill="#648b8b">${hasRun ? "FLOWING" : "READY"}</text></svg><div class="sample-mini-foot"><span><strong>Porosity</strong><b>${porosity.toFixed(0)}%</b></span><span><strong>Collected</strong><b>${formatVolume(volume)} mL</b></span><span><strong>Elapsed</strong><b>${formatClock(elapsed)}</b></span><span class="sample-note">${escapeHtml(material.note)}</span></div></article>`;
+      return `<article class="sample-mini"><div class="sample-mini-head"><span class="sample-index" style="--sample-color:${materialPlotColor(material.id, index)}">${index + 1}</span><strong>${escapeHtml(material.label)}</strong><span class="sample-flow-pill">${flow}</span></div><svg viewBox="0 0 180 150" role="img" aria-label="${escapeHtml(material.label)}: ${porosity.toFixed(0)} percent pore space, ${formatVolume(volume)} millilitres collected"><title>${escapeHtml(material.label)} simulated flow sample</title><path d="M84 6v17" stroke="#72948a" stroke-width="4"/><rect x="45" y="19" width="78" height="110" rx="7" fill="#fffefa" stroke="#809686" stroke-width="2.5"/><path d="M52 28h64v91H52z" fill="#f2ede0"/><path d="M84 29v88" stroke="#65a0a5" stroke-width="2" stroke-dasharray="4 5" opacity=".72"/>${grains}${drops}<path d="M84 129v9" stroke="#73968f" stroke-width="4"/><rect x="68" y="137" width="32" height="12" rx="3" fill="#fffefa" stroke="#92a394" stroke-width="1.5"/><rect x="70" y="${fillY}" width="28" height="${fill}" rx="2" fill="#79b4b8" opacity=".9"/><text x="84" y="14" text-anchor="middle" font-family="DM Sans,sans-serif" font-size="9" fill="#6f8276">WATER</text><text x="84" y="148" text-anchor="middle" font-family="DM Sans,sans-serif" font-size="7" fill="#648b8b">${hasRun ? "FLOWING" : "READY"}</text></svg><div class="sample-mini-foot"><span><strong>Porosity</strong><b>${porosity.toFixed(0)}%</b></span><span><strong>Collected</strong><b>${formatVolume(volume)} mL</b></span><span><strong>Elapsed</strong><b>${formatClock(elapsed)}</b></span><span class="sample-note">${escapeHtml(material.note)}</span></div></article>`;
     }).join("")}</div>`;
   }
 
@@ -1199,8 +1341,8 @@
       svg += `<line class="chart-grid chart-time-grid" x1="${xx}" y1="${top}" x2="${xx}" y2="${top + plotH}"/><text class="chart-label" x="${xx}" y="${top + plotH + 15}" text-anchor="middle">${value}</text>`;
     }
     svg += `<line class="chart-axis" x1="${left}" y1="${top}" x2="${left}" y2="${top + plotH}"/><line class="chart-axis" x1="${left}" y1="${top + plotH}" x2="${W - right}" y2="${top + plotH}"/>`;
-    projections.forEach(({ series, collected, rate }, index) => {
-      const color = GRAPH_COLORS[index % GRAPH_COLORS.length];
+    projections.forEach(({ id, material, series, collected, rate }, index) => {
+      const color = materialPlotColor(id || material?.id, index);
       if (state.hasRun && series) {
         const points = (series.points || [{ t: 0, v: 0 }]).filter((point) => point.t <= visibleTime);
         const current = state.running ? series.volume : collected;
@@ -1226,7 +1368,7 @@
     $(".chart-wrap").style.height = `${H}px`;
     $("#chart-legend").innerHTML = projections.map(({ id, material, collected }, index) => {
       const qualifier = state.hasRun ? "collected at selected time" : `model estimate at ${visibleTime} sec`;
-      return `<span class="legend-item"><i class="legend-dot" style="background:${GRAPH_COLORS[index % GRAPH_COLORS.length]}"></i>${escapeHtml(material.label)} · <strong>${formatVolume(collected)} mL</strong> <small>${qualifier}</small></span>`;
+      return `<span class="legend-item"><i class="legend-dot" style="background:${materialPlotColor(id || material.id, index)}"></i>${escapeHtml(material.label)} · <strong>${formatVolume(collected)} mL</strong> <small>${qualifier}</small></span>`;
     }).join("") + overlays.map((item, index) => `<button type="button" class="legend-item history-legend" data-history-overlay="${escapeHtml(item.key)}" aria-label="Remove ${escapeHtml(getMaterial(item.id).label)} saved trial from graph"><i class="legend-dot" style="background:${HISTORY_COLORS[index % HISTORY_COLORS.length]}"></i>${escapeHtml(getMaterial(item.id).label)} · saved ${new Date(item.attempt.savedAt).toLocaleDateString()}</button>`).join("");
     const scaleNote = $("#graph-scale-note");
     scaleNote.hidden = false;
@@ -1363,6 +1505,36 @@
       return `<article class="question-card ${String(savedAnswer ?? "").trim() ? "answered" : ""}" data-question-card="${escapeHtml(question.id)}"><div class="question-top"><span class="question-number">${String(index + 1).padStart(2, "0")}</span><div class="question-body"><div class="question-type">${escapeHtml(question.stage)}</div><p class="question-prompt">${escapeHtml(question.prompt)}</p>${question.hint ? `<p class="question-hint">${escapeHtml(question.hint)}</p>` : ""}<textarea class="answer-short" data-question="${escapeHtml(question.id)}" maxlength="700" rows="2" aria-label="Your thinking for ${escapeHtml(question.stage.toLowerCase())}" placeholder="Add your thinking here…">${escapeHtml(savedAnswer ?? "")}</textarea></div></div>${feedback ? `<div class="answer-feedback pending">${escapeHtml(feedback)}</div>` : ""}</article>`;
     }).join("");
     renderProgress();
+    const submitButton = $("#submit-lesson");
+    submitButton.classList.toggle("is-complete", Boolean(state.submitted));
+    submitButton.innerHTML = state.submitted ? "<span>Submitted ✓</span><span>↻</span>" : "<span>Submit</span><span>→</span>";
+  }
+
+  function setProgressButtonsSaved(syncPending = false) {
+    $$(".save-progress-button").forEach((button) => {
+      button.classList.add("is-saved");
+      button.classList.toggle("sync-pending", syncPending);
+      button.textContent = syncPending ? "Saved here · sync pending" : "Saved ✓";
+    });
+  }
+
+  function resetProgressButtons() {
+    $$(".save-progress-button").forEach((button) => {
+      button.classList.remove("is-saved", "sync-pending");
+      button.textContent = "Save progress";
+    });
+  }
+
+  function markCheckInEdited() {
+    unsavedWork = true;
+    resetProgressButtons();
+    if (state.submitted) {
+      state.submitted = false;
+      state.submittedAt = null;
+      const message = $("#submit-message");
+      message.hidden = false;
+      message.textContent = "Changes have been made since the last submission. Submit again to update the work your teacher sees.";
+    }
   }
 
   const teacherUndoStack = [];
@@ -1374,6 +1546,27 @@
   function updateTeacherHistoryButtons() {
     $("#undo-teacher-edit").disabled = teacherUndoStack.length === 0;
     $("#redo-teacher-edit").disabled = teacherRedoStack.length === 0;
+  }
+  function updatePublishStatus(record = activeClass()) {
+    if (!record) return;
+    const current = { lessonTitle: state.lessonTitle, lessonIntentions: state.lessonIntentions, lessonDescription: state.lessonDescription, questions: state.questions, workflowSteps: state.workflowSteps, customMaterials: state.customMaterials };
+    const published = record.publishedContent || null;
+    const publishedVersion = published ? {
+      lessonTitle: String(published.lessonTitle || ""),
+      lessonIntentions: String(published.lessonIntentions || ""),
+      lessonDescription: String(published.lessonDescription || ""),
+      questions: normalizeLessonQuestions(published.questions, published.questionPrompts),
+      workflowSteps: normalizeWorkflowSteps(published.workflowSteps, published.workflowNotes),
+      customMaterials: normalizeCustomMaterials(published.customMaterials)
+    } : null;
+    const hasUnpublishedChanges = Boolean(state.published && publishedVersion && JSON.stringify(current) !== JSON.stringify(publishedVersion));
+    const publishedLabel = state.publishedAt ? new Date(state.publishedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "previously published";
+    $("#publish-status").textContent = hasUnpublishedChanges ? `DRAFT CHANGES · students see ${publishedLabel}` : state.published ? `PUBLISHED · ${publishedLabel}` : `DRAFT · ${state.questions.length} prompts`;
+    $("#publish-status").classList.toggle("published", state.published && !hasUnpublishedChanges);
+    $("#publish-status").classList.toggle("has-draft-changes", hasUnpublishedChanges);
+    const publishButton = $("#publish-lesson");
+    publishButton.classList.toggle("is-published", state.published && !hasUnpublishedChanges);
+    publishButton.textContent = state.published && !hasUnpublishedChanges ? "Published ✓" : hasUnpublishedChanges ? "Publish updates" : "Publish lesson";
   }
   function recordTeacherEdit() {
     teacherUndoStack.push(teacherEditorSnapshot());
@@ -1410,6 +1603,7 @@
     questionList.innerHTML = state.questions.map((question, index) => `<article class="lesson-editor-item" draggable="true" data-editor-type="question" data-editor-id="${escapeHtml(question.id)}"><div class="lesson-editor-item-head"><strong><span class="editor-drag-handle" aria-hidden="true">⠿</span> Question ${index + 1}</strong><div class="lesson-editor-item-actions"><button type="button" data-editor-move="up" data-editor-type="question" data-editor-id="${escapeHtml(question.id)}" aria-label="Move question ${index + 1} up" ${index === 0 ? "disabled" : ""}>↑</button><button type="button" data-editor-move="down" data-editor-type="question" data-editor-id="${escapeHtml(question.id)}" aria-label="Move question ${index + 1} down" ${index === state.questions.length - 1 ? "disabled" : ""}>↓</button><button type="button" class="delete-lesson-item" data-editor-delete="true" data-editor-type="question" data-editor-id="${escapeHtml(question.id)}" aria-label="Delete question ${index + 1}">⌫</button></div></div><label>Step label<input type="text" maxlength="80" data-question-field="stage" data-editor-id="${escapeHtml(question.id)}" value="${escapeHtml(question.stage)}" /></label><label>Question<textarea rows="2" maxlength="700" data-question-field="prompt" data-editor-id="${escapeHtml(question.id)}" placeholder="Write a clear question for learners">${escapeHtml(question.prompt)}</textarea></label><label>Optional hint<textarea rows="2" maxlength="350" data-question-field="hint" data-editor-id="${escapeHtml(question.id)}" placeholder="Give a short scaffold, example or starting point">${escapeHtml(question.hint)}</textarea></label></article>`).join("") || `<p class="editor-empty">No questions yet. Add one when you are ready.</p>`;
     workflowList.innerHTML = state.workflowSteps.map((step, index) => `<article class="lesson-editor-item" draggable="true" data-editor-type="step" data-editor-id="${escapeHtml(step.id)}"><div class="lesson-editor-item-head"><strong><span class="editor-drag-handle" aria-hidden="true">⠿</span> Guide step ${index + 1}</strong><div class="lesson-editor-item-actions"><button type="button" data-editor-move="up" data-editor-type="step" data-editor-id="${escapeHtml(step.id)}" aria-label="Move guide step ${index + 1} up" ${index === 0 ? "disabled" : ""}>↑</button><button type="button" data-editor-move="down" data-editor-type="step" data-editor-id="${escapeHtml(step.id)}" aria-label="Move guide step ${index + 1} down" ${index === state.workflowSteps.length - 1 ? "disabled" : ""}>↓</button><button type="button" class="delete-lesson-item" data-editor-delete="true" data-editor-type="step" data-editor-id="${escapeHtml(step.id)}" aria-label="Delete guide step ${index + 1}">⌫</button></div></div><label>Step title<input type="text" maxlength="80" data-step-field="title" data-editor-id="${escapeHtml(step.id)}" value="${escapeHtml(step.title)}" /></label><label>Directions<textarea rows="3" maxlength="500" data-step-field="note" data-editor-id="${escapeHtml(step.id)}" placeholder="Explain what learners should do">${escapeHtml(step.note)}</textarea></label></article>`).join("") || `<p class="editor-empty">No guide steps yet. Add one when you are ready.</p>`;
     updateTeacherHistoryButtons();
+    updatePublishStatus();
   }
 
   function renderTeacher() {
@@ -1424,13 +1618,7 @@
     $("#lesson-intentions").value = state.lessonIntentions;
     $("#lesson-description").value = state.lessonDescription;
     renderTeacherEditors();
-    const currentLessonVersion = { lessonTitle: state.lessonTitle, lessonIntentions: state.lessonIntentions, lessonDescription: state.lessonDescription, questions: state.questions, workflowSteps: state.workflowSteps };
-    const publishedLessonVersion = record.publishedContent || null;
-    const hasUnpublishedChanges = Boolean(state.published && publishedLessonVersion && JSON.stringify(currentLessonVersion) !== JSON.stringify(publishedLessonVersion));
-    const publishedLabel = state.publishedAt ? new Date(state.publishedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "previously published";
-    $("#publish-status").textContent = hasUnpublishedChanges ? `DRAFT CHANGES · students see ${publishedLabel}` : state.published ? `PUBLISHED · ${publishedLabel}` : `DRAFT · ${state.questions.length} prompts`;
-    $("#publish-status").classList.toggle("published", state.published && !hasUnpublishedChanges);
-    $("#publish-status").classList.toggle("has-draft-changes", hasUnpublishedChanges);
+    updatePublishStatus(record);
     $("#active-class-label").textContent = record.name;
     $("#active-class-subtitle").textContent = `${record.students.length} ${record.students.length === 1 ? "learner" : "learners"} on the list`;
     $("#join-code-display").textContent = record.code;
@@ -1513,6 +1701,7 @@
     state.lessonDescription = target.lessonDescription;
     state.questions = normalizeLessonQuestions(target.questions, target.questionPrompts);
     state.workflowSteps = normalizeWorkflowSteps(target.workflowSteps, target.workflowNotes);
+    setCustomMaterials(target.customMaterials);
     state.completedWorkflowSteps = [];
     state.published = Boolean(target.published);
     state.publishedAt = target.publishedAt || null;
@@ -1548,6 +1737,7 @@
     state.lessonDescription = record.lessonDescription;
     state.questions = normalizeLessonQuestions(record.questions, record.questionPrompts);
     state.workflowSteps = normalizeWorkflowSteps(record.workflowSteps, record.workflowNotes);
+    setCustomMaterials(record.customMaterials || []);
     state.completedWorkflowSteps = [];
     state.published = false;
     state.publishedAt = null;
@@ -1614,6 +1804,7 @@
       students: (Array.isArray(remoteRecord?.students) ? remoteRecord.students : []).map(normalizeStudent),
       questions: normalizeLessonQuestions(remoteRecord?.questions, remoteRecord?.questionPrompts),
       workflowSteps: normalizeWorkflowSteps(remoteRecord?.workflowSteps, remoteRecord?.workflowNotes),
+      customMaterials: normalizeCustomMaterials(remoteRecord?.customMaterials),
       questionPrompts: migrateQuestionPrompts(remoteRecord?.questionPrompts),
       workflowNotes: migrateWorkflowNotes(remoteRecord?.workflowNotes)
     };
@@ -1628,6 +1819,7 @@
     state.lessonDescription = record.lessonDescription || "";
     state.questions = normalizeLessonQuestions(record.questions, record.questionPrompts);
     state.workflowSteps = normalizeWorkflowSteps(record.workflowSteps, record.workflowNotes);
+    setCustomMaterials(record.customMaterials);
     state.completedWorkflowSteps = [];
     state.published = Boolean(record.published);
     state.publishedAt = record.publishedAt || null;
@@ -1712,9 +1904,12 @@
     $("#materials-body").innerHTML = materials.map((material) => {
       const flow = flowBand(hydraulics(material).qMlMin);
       const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(material.label)}`;
-      return `<tr><td><span class="material-key"><i class="material-dot" style="background:${material.color}"></i><a class="material-search-link" href="${searchUrl}" target="_blank" rel="noopener noreferrer" aria-label="Search Google for ${escapeHtml(material.label)}">${escapeHtml(material.label)}</a></span></td><td>${material.porosity}%</td><td>${flow}</td><td>${escapeHtml(material.note)}</td><td class="advanced-only">${Number(material.k).toExponential(2)}</td></tr>`;
+      const remove = material.custom && state.userRole === "teacher" ? `<button type="button" class="remove-custom-material" data-remove-custom-material="${escapeHtml(material.id)}" aria-label="Remove ${escapeHtml(material.label)} from this class">Remove</button>` : "";
+      return `<tr><td><span class="material-key"><i class="material-dot" style="background:${material.color}"></i><a class="material-search-link" href="${searchUrl}" target="_blank" rel="noopener noreferrer" aria-label="Search Google for ${escapeHtml(material.label)}">${escapeHtml(material.label)}</a></span></td><td>${material.porosity}%</td><td>${flow}</td><td>${escapeHtml(material.note)}</td><td class="advanced-only">${Number(material.k).toExponential(2)}</td><td class="advanced-only">${remove}</td></tr>`;
     }).join("");
     const advanced = libraryMode === "advanced";
+    $("#materials-count").textContent = String(materials.length);
+    $("#custom-material-tools").hidden = !advanced || state.userRole !== "teacher";
     $("#view-sources").classList.toggle("library-advanced", advanced);
     $$("[data-library-mode]").forEach((button) => {
       const selected = button.dataset.libraryMode === libraryMode;
@@ -1876,7 +2071,7 @@
       return '<div class="replay-setting"><div><span>' + setting.label + '</span><output>' + setting.value + setting.unit + '</output></div><div class="replay-track" role="img" aria-label="' + setting.label + ': ' + setting.value + setting.unit + ', view only"><i style="width:' + position + '%"></i></div><small><span>' + setting.min + setting.unit + '</span><span>' + setting.max + setting.unit + '</span></small></div>';
     }).join("");
     const materialMarkup = materialsInReplay.map((material, index) => {
-      const color = GRAPH_COLORS[index % GRAPH_COLORS.length];
+      const color = materialPlotColor(material.id, index);
       const porosity = effectivePorosity(material, replay.compaction);
       const k = effectiveK(material, replay.compaction);
       const power = Math.floor(Math.log10(k));
@@ -1887,7 +2082,7 @@
     const valuesMarkup = materialsInReplay.map((material, index) => {
       const series = replay.series && replay.series[material.id];
       const volume = Number.isFinite(series && series.cursorVolume) ? series.cursorVolume : Number(series && series.volume) || 0;
-      const color = GRAPH_COLORS[index % GRAPH_COLORS.length];
+      const color = materialPlotColor(material.id, index);
       return '<div class="replay-volume-row"><span><i style="background:' + color + '"></i>' + escapeHtml(material.label) + '</span><strong>' + formatVolume(volume) + ' <small>mL</small></strong></div>';
     }).join("");
     const visualMarkup = materialsInReplay.length > 1
@@ -1944,7 +2139,7 @@
     }
     svg += '<line class="chart-axis" x1="' + left + '" y1="' + top + '" x2="' + left + '" y2="' + (top + plotH) + '"/><line class="chart-axis" x1="' + left + '" y1="' + (top + plotH) + '" x2="' + (W - right) + '" y2="' + (top + plotH) + '"/>';
     projections.forEach(({ material, series, collected, rate }, index) => {
-      const color = GRAPH_COLORS[index % GRAPH_COLORS.length];
+      const color = materialPlotColor(material.id || projections[index]?.id, index);
       if (replay.hasRun && series) {
         const points = (series.points || [{ t: 0, v: 0 }]).filter((point) => point.t <= visibleTime).map((point) => ({ t: point.t, v: point.v }));
         const last = points[points.length - 1];
@@ -1959,7 +2154,7 @@
     svg += '<text class="chart-axis-title" x="16" y="' + (top + plotH / 2) + '" text-anchor="middle" transform="rotate(-90 16 ' + (top + plotH / 2) + ')">WATER COLLECTED (mL)</text><text class="chart-axis-title" x="' + (left + plotW / 2) + '" y="' + (H - 3) + '" text-anchor="middle">TIME (seconds)</text>';
     chart.innerHTML = svg;
     chart.setAttribute("aria-label", "Reconstructed cumulative water collected against time on one shared linear scale: " + projections.map((item) => item.material.label + ": " + formatVolume(item.collected) + " millilitres").join("; ") + ".");
-    $("#replay-chart-legend").innerHTML = projections.map(({ material, collected }, index) => '<span class="replay-legend-item"><i style="background:' + GRAPH_COLORS[index % GRAPH_COLORS.length] + '"></i>' + escapeHtml(material.label) + ' <strong>' + formatVolume(collected) + ' mL</strong></span>').join("");
+    $("#replay-chart-legend").innerHTML = projections.map(({ material, collected }, index) => '<span class="replay-legend-item"><i style="background:' + materialPlotColor(material.id, index) + '"></i>' + escapeHtml(material.label) + ' <strong>' + formatVolume(collected) + ' mL</strong></span>').join("");
   }
 
   function showToast(message) {
@@ -1973,7 +2168,10 @@
   function showView(view) {
     const targetId = `view-${view}`;
     if (!$(`#${targetId}`)) return;
+    if (view === "teacher" && state.userRole !== "teacher") { showView("entry"); return; }
+    if (state.userRole === "guest" && !["entry", "intro", "explore", "sources", "accessibility"].includes(view)) { showToast("Choose Teacher or Student to open class tools."); return; }
     state.view = view;
+    try { sessionStorage.setItem(VIEW_SESSION_KEY, view); } catch { /* View restoration is optional. */ }
     $$(".view").forEach((section) => { section.hidden = section.id !== targetId; section.classList.toggle("active-view", section.id === targetId); });
     $$(".nav-item[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
     renderStudentAccess();
@@ -1981,6 +2179,10 @@
     if (view === "lesson") renderQuestions();
     window.scrollTo({ top: 0, behavior: "smooth" });
     if (view === "join") setTimeout(() => $("#join-code").focus(), 40);
+    if (view === "intro") {
+      requestAnimationFrame(() => renderIntroStep(state.introStep));
+      setTimeout(() => renderIntroStep(state.introStep), 60);
+    }
   }
 
   function openDialog(title, content) {
@@ -2079,16 +2281,55 @@
     openDialog("Teacher desk · " + title, `<p>${escapeHtml(copy)}</p><div class="tour-actions"><button class="quiet-button" type="button" data-tour-back ${teacherTourStep === 0 ? "disabled" : ""}>Back</button><button class="small-primary" type="button" data-tour-next>${teacherTourStep === teacherTour.length - 1 ? "Finish" : "Next"}</button><button class="quiet-button" type="button" data-tour-skip>Skip tour</button></div>`);
   }
 
-  function readVisiblePageAloud() {
-    const button = $("#read-aloud-button");
-    if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
-      showToast("Read aloud is not available in this browser.");
-      return;
+  function chooseRole(role) {
+    if (role === "guest") beginGuestSession();
+    else endGuestSession();
+    state.userRole = role;
+    try { sessionStorage.setItem(ROLE_SESSION_KEY, role); } catch { /* Role choice is optional. */ }
+    if (role !== "student") {
+      state.currentStudentId = null;
+      sessionStorage.removeItem(STUDENT_SESSION_KEY);
+      sessionStorage.removeItem(STUDENT_TOKEN_KEY);
+      state.students = activeClass()?.students || [];
+      window.history.replaceState({}, "", window.location.pathname + window.location.hash);
     }
-    if (window.speechSynthesis.speaking) {
-      window.speechSynthesis.cancel();
-      button.textContent = "Read aloud";
-      button.setAttribute("aria-pressed", "false");
+    state.introDone = false;
+    renderAll();
+    showView(role === "student" ? "join" : "intro");
+  }
+
+  function startNewTeacherWorkspace() {
+    const record = makeClass("Class name", generateUniqueClassCode(), []);
+    record.createdAt = Date.now();
+    record.updatedAt = record.createdAt;
+    state.classRecords.push(record);
+    chooseRole("teacher");
+    activateClass(record.id);
+    renderAll();
+    renderTeacher();
+    showView("intro");
+    showToast("Your new teacher workspace is ready. Find both codes on the Teacher desk.");
+  }
+
+  function toggleScreenReader(forceOpen) {
+    const panel = $("#screen-reader-panel");
+    const button = $("#read-aloud-button");
+    const open = typeof forceOpen === "boolean" ? forceOpen : panel.hidden;
+    panel.hidden = !open;
+    button.setAttribute("aria-expanded", String(open));
+    button.textContent = open ? "Close Screen Reader" : "Open Screen Reader";
+    if (!open) stopScreenReader();
+    else $("#screen-reader-play").focus();
+  }
+  function stopScreenReader() {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    $("#screen-reader-pause").disabled = true;
+    $("#screen-reader-pause").textContent = "Pause";
+    $("#screen-reader-status").textContent = "Select text before pressing Read page to read only that section.";
+  }
+  function speakVisiblePage() {
+    if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
+      $("#screen-reader-status").textContent = "Screen reading is not available in this browser.";
       return;
     }
     let text = window.getSelection()?.toString().trim() || "";
@@ -2098,37 +2339,209 @@
       copy?.querySelectorAll("button, input, select, textarea, [hidden]").forEach((item) => item.remove());
       text = copy?.innerText || copy?.textContent || "";
     }
-    text = text.replace(/\s+/g, " ").trim().slice(0, 12000);
-    if (!text) { showToast("There is no visible page text to read."); return; }
-    const speech = new SpeechSynthesisUtterance(text);
-    speech.onend = speech.onerror = () => {
-      button.textContent = "Read aloud";
-      button.setAttribute("aria-pressed", "false");
-    };
-    button.textContent = "Stop reading";
-    button.setAttribute("aria-pressed", "true");
+    text = text.replace(/\s+/g, " ").trim().slice(0, 16000);
+    if (!text) {
+      $("#screen-reader-status").textContent = "There is no page text available to read.";
+      return;
+    }
     window.speechSynthesis.cancel();
+    const speech = new SpeechSynthesisUtterance(text);
+    speech.rate = Number($("#screen-reader-speed").value) || 1;
+    speech.onstart = () => {
+      $("#screen-reader-pause").disabled = false;
+      $("#screen-reader-pause").textContent = "Pause";
+      $("#screen-reader-status").textContent = "Reading. Use Pause or Stop at any time.";
+    };
+    speech.onend = () => {
+      $("#screen-reader-pause").disabled = true;
+      $("#screen-reader-pause").textContent = "Pause";
+      $("#screen-reader-status").textContent = "Finished reading this page.";
+    };
+    speech.onerror = () => {
+      $("#screen-reader-pause").disabled = true;
+      $("#screen-reader-status").textContent = "The browser could not read this page aloud.";
+    };
+    $("#screen-reader-status").textContent = "Starting…";
     window.speechSynthesis.speak(speech);
+  }
+  function toggleSpeechPause() {
+    if (!window.speechSynthesis?.speaking) return;
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+      $("#screen-reader-pause").textContent = "Pause";
+      $("#screen-reader-status").textContent = "Reading.";
+    } else {
+      window.speechSynthesis.pause();
+      $("#screen-reader-pause").textContent = "Play";
+      $("#screen-reader-status").textContent = "Paused.";
+    }
   }
 
   // Navigation and mode controls
+  $("#entry-guest").addEventListener("click", () => chooseRole("guest"));
+  $("#entry-student").addEventListener("click", () => chooseRole("student"));
+  $("#entry-teacher").addEventListener("click", () => {
+    $("#entry-teacher-form").hidden = false;
+    $("#entry-new-teacher").hidden = false;
+    $("#entry-teacher-error").hidden = true;
+    $("#entry-class-code").focus();
+  });
+  $("#entry-new-teacher").addEventListener("click", startNewTeacherWorkspace);
+  $("#entry-back-to-workspaces").addEventListener("click", () => {
+    $("#entry-teacher-form").hidden = true;
+    $("#entry-new-teacher").hidden = true;
+    $("#entry-teacher-error").hidden = true;
+    $("#entry-teacher").focus();
+  });
+  $("#entry-teacher-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const code = normalizeRecoveryCode($("#entry-class-code").value);
+    const teacherCode = normalizeRecoveryCode($("#entry-teacher-code").value);
+    const status = $("#entry-teacher-error");
+    status.textContent = "Checking the class codes…";
+    status.hidden = false;
+    const localRecord = state.classRecords.find((item) => normalizeRecoveryCode(item.code) === code && normalizeRecoveryCode(item.teacherCode) === teacherCode);
+    if (localRecord) {
+      restoreSharedTeacherClass(localRecord, teacherCode);
+      chooseRole("teacher");
+      persist();
+      showToast("Teacher workspace reopened.");
+      return;
+    }
+    if (cloudEnabled) {
+      try {
+        const result = await cloudRequest("teacher-load", { classCode: code, teacherCode });
+        restoreSharedTeacherClass(result.classRecord, teacherCode);
+        chooseRole("teacher");
+        persist();
+        showToast("Shared teacher workspace reopened.");
+        return;
+      } catch (error) {
+        status.textContent = error?.message || "Could not open that class. Check both codes and try again.";
+        return;
+      }
+    }
+    status.textContent = "No saved class matched those codes in this browser.";
+  });
+  async function flushCurrentCloudSave() {
+    clearTimeout(cloudSaveTimer);
+    if (!cloudEnabled || state.userRole === "guest") return true;
+    captureClassState();
+    const record = activeClass();
+    if (!record) return true;
+    try {
+      if (state.currentStudentId) {
+        const learner = currentStudent();
+        const studentToken = sessionStorage.getItem(STUDENT_TOKEN_KEY);
+        if (!learner || !studentToken) return false;
+        await cloudRequest("student-save", { classCode: record.code, studentName: learner.name, studentToken, learner });
+      } else if (state.userRole === "teacher") {
+        await cloudRequest("teacher-save", { classCode: record.code, teacherCode: record.teacherCode, classRecord: record });
+      }
+      return true;
+    } catch {
+      showToast("The latest change could not sync yet. It remains saved in this browser.");
+      return false;
+    }
+  }
+  $("#change-role").addEventListener("click", async () => {
+    await flushCurrentCloudSave();
+    state.currentStudentId = null;
+    state.teacherPreview = false;
+    sessionStorage.removeItem(STUDENT_SESSION_KEY);
+    sessionStorage.removeItem(STUDENT_TOKEN_KEY);
+    sessionStorage.removeItem(ROLE_SESSION_KEY);
+    sessionStorage.removeItem(VIEW_SESSION_KEY);
+    endGuestSession();
+    state.userRole = "";
+    state.view = "entry";
+    renderAll();
+    showView("entry");
+  });
+  $("#join-back-to-entry").addEventListener("click", () => {
+    sessionStorage.removeItem(ROLE_SESSION_KEY);
+    sessionStorage.removeItem(VIEW_SESSION_KEY);
+    endGuestSession();
+    state.userRole = "guest";
+    beginGuestSession();
+    state.currentStudentId = null;
+    state.teacherPreview = false;
+    window.history.replaceState({}, "", window.location.pathname + window.location.hash);
+    showView("entry");
+  });
   $$("[data-view]").forEach((button) => button.addEventListener("click", () => {
     touchActivity();
     if (button.dataset.view === "join" && !state.currentStudentId && (button.classList.contains("header-join-button") || state.view === "teacher")) state.teacherPreview = true;
     showView(button.dataset.view);
   }));
   $$("[data-intro-step]").forEach((button) => button.addEventListener("click", () => { renderIntroStep(button.dataset.introStep); touchActivity(); }));
-  $("[data-library-mode]").forEach((button) => button.addEventListener("click", () => {
+  $$("[data-library-mode]").forEach((button) => button.addEventListener("click", () => {
     libraryMode = button.dataset.libraryMode === "advanced" ? "advanced" : "simple";
     try { localStorage.setItem(LIBRARY_MODE_KEY, libraryMode); } catch { /* Selection is optional. */ }
     renderMaterialsTable();
   }));
+  $("#custom-material-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const label = $("#custom-material-name").value.trim().replace(/\s+/g, " ");
+    const porosity = Number($("#custom-material-porosity").value);
+    const k = Number($("#custom-material-k").value);
+    const status = $("#custom-material-status");
+    if (!label || materials.some((material) => material.label.toLocaleLowerCase() === label.toLocaleLowerCase())) {
+      status.textContent = "Enter a name that is not already in this library.";
+      return;
+    }
+    if (!Number.isFinite(porosity) || porosity < 0 || porosity > 100 || !Number.isFinite(k) || k <= 0 || k > 0.1) {
+      status.textContent = "Use porosity from 0–100% and K greater than 0 up to 0.1 m/s.";
+      return;
+    }
+    const newMaterial = {
+      id: `custom-${createId("material")}`, label,
+      category: $("#custom-material-category").value.trim() || "Custom material",
+      k, porosity, color: $("#custom-material-color").value,
+      grain: "Teacher-entered model values",
+      note: $("#custom-material-description").value.trim() || "Teacher-added model input. Check how closely it represents a real sample.",
+      custom: true
+    };
+    unsavedWork = true;
+    setCustomMaterials([...state.customMaterials, newMaterial]);
+    $("#custom-material-form").reset();
+    $("#custom-material-color").value = "#597b66";
+    renderAll();
+    renderTeacher();
+    persist();
+    status.textContent = `${label} added to this class. Save and publish the lesson for students to use it.`;
+  });
+  $("#materials-body").addEventListener("click", (event) => {
+    const remove = event.target.closest("[data-remove-custom-material]");
+    if (!remove || state.userRole !== "teacher") return;
+    const material = materialById[remove.dataset.removeCustomMaterial];
+    if (!material?.custom) return;
+    setCustomMaterials(state.customMaterials.filter((item) => item.id !== material.id));
+    unsavedWork = true;
+    renderAll();
+    renderTeacher();
+    persist();
+    showToast(`${material.label} removed from this class. Publish to update the student version.`);
+  });
   $("#text-size-setting").addEventListener("change", (event) => { accessibilitySettings.textScale = Number(event.target.value); saveAccessibilitySettings(); });
   $("#contrast-setting").addEventListener("change", (event) => { accessibilitySettings.theme = event.target.value; saveAccessibilitySettings(); });
+  $("#reading-font-setting").addEventListener("change", (event) => {
+    accessibilitySettings.readingFont = event.target.value === "clear" ? "clear" : "standard";
+    saveAccessibilitySettings();
+  });
+  $("#chart-palette-setting").addEventListener("change", (event) => {
+    accessibilitySettings.chartPalette = event.target.value === "color-safe" ? "color-safe" : "standard";
+    saveAccessibilitySettings();
+    renderAll();
+  });
   $("#motion-setting").addEventListener("change", (event) => { accessibilitySettings.reduceMotion = event.target.checked; saveAccessibilitySettings(); });
-  $("#read-aloud-button").addEventListener("click", readVisiblePageAloud);
+  $("#read-aloud-button").addEventListener("click", () => toggleScreenReader());
+  $("#screen-reader-close").addEventListener("click", () => toggleScreenReader(false));
+  $("#screen-reader-play").addEventListener("click", () => speakVisiblePage());
+  $("#screen-reader-pause").addEventListener("click", () => toggleSpeechPause());
+  $("#screen-reader-stop").addEventListener("click", () => stopScreenReader());
   $("#reset-accessibility").addEventListener("click", () => {
-    accessibilitySettings = { textScale: 1, theme: "default", reduceMotion: false };
+    accessibilitySettings = { textScale: 1, theme: "default", readingFont: "standard", chartPalette: "standard", reduceMotion: false };
     saveAccessibilitySettings();
     showToast("Display settings reset.");
   });
@@ -2254,6 +2667,7 @@
   $("#question-list").addEventListener("change", (event) => {
     const target = event.target;
     if (target.matches("input[type=radio]")) {
+      markCheckInEdited();
       state.answers[target.name] = target.value;
       logEvent("question_answered", { question: target.name, answer: target.value });
       renderQuestions(); persist(); touchActivity();
@@ -2268,6 +2682,7 @@
   $("#question-list").addEventListener("input", (event) => {
     const target = event.target;
     if (!target.matches("[data-question]")) return;
+    markCheckInEdited();
     state.answers[target.dataset.question] = target.value;
     renderProgress();
     clearTimeout(target.persistTimer);
@@ -2277,6 +2692,30 @@
     }, 500);
     touchActivity();
   });
+  async function saveCheckInProgress() {
+    persist();
+    const message = $("#submit-message");
+    message.hidden = false;
+    if (cloudEnabled && (currentStudent() || state.userRole === "teacher")) {
+      const synced = await flushCurrentCloudSave();
+      if (synced) {
+        unsavedWork = false;
+        message.textContent = `Progress saved to your class at ${new Date().toLocaleString()}.`;
+        setProgressButtonsSaved();
+        showToast("Progress saved to the shared class.");
+      } else {
+        message.textContent = `Saved in this browser at ${new Date().toLocaleString()}. Shared sync is still pending.`;
+        setProgressButtonsSaved(true);
+      }
+      return;
+    }
+    unsavedWork = false;
+    message.textContent = `Progress saved on this device at ${new Date().toLocaleString()}.`;
+    setProgressButtonsSaved();
+    showToast("Progress saved on this device.");
+  }
+  $("#save-progress-top").addEventListener("click", saveCheckInProgress);
+  $("#save-progress-bottom").addEventListener("click", saveCheckInProgress);
   $("#submit-lesson").addEventListener("click", async () => {
     touchActivity();
     state.submitted = true;
@@ -2290,6 +2729,7 @@
       const studentToken = sessionStorage.getItem(STUDENT_TOKEN_KEY);
       try {
         await cloudRequest("student-save", { classCode: activeClass().code, studentName: currentStudent().name, studentToken, learner: currentStudent() });
+        unsavedWork = false;
         message.textContent = `Saved to your class at ${new Date(state.submittedAt).toLocaleString()}. You can return on another device with your class code and roster name.`;
         showToast("Check-in saved to the shared class.");
       } catch {
@@ -2297,6 +2737,7 @@
         showToast("Saved on this device; shared sync is still pending.");
       }
     } else {
+      unsavedWork = false;
       message.textContent = `Saved on this device at ${new Date(state.submittedAt).toLocaleString()}.`;
       showToast("Check-in saved on this device.");
     }
@@ -2304,26 +2745,28 @@
   });
 
   // Teacher authoring: editable question and guide lists, ordering, and history.
-  $("#lesson-name").addEventListener("input", (event) => { recordTeacherEdit(); state.lessonTitle = event.target.value.slice(0, 100); renderQuestions(); persist(); });
-  $("#lesson-intentions").addEventListener("input", (event) => { recordTeacherEdit(); state.lessonIntentions = event.target.value.slice(0, 500); renderQuestions(); persist(); });
-  $("#lesson-description").addEventListener("input", (event) => { recordTeacherEdit(); state.lessonDescription = event.target.value.slice(0, 500); renderQuestions(); persist(); });
+  $("#lesson-name").addEventListener("input", (event) => { unsavedWork = true; recordTeacherEdit(); state.lessonTitle = event.target.value.slice(0, 100); renderQuestions(); updatePublishStatus(); persist(); });
+  $("#lesson-intentions").addEventListener("input", (event) => { unsavedWork = true; recordTeacherEdit(); state.lessonIntentions = event.target.value.slice(0, 500); renderQuestions(); updatePublishStatus(); persist(); });
+  $("#lesson-description").addEventListener("input", (event) => { unsavedWork = true; recordTeacherEdit(); state.lessonDescription = event.target.value.slice(0, 500); renderQuestions(); updatePublishStatus(); persist(); });
   $("#question-editor-list").addEventListener("input", (event) => {
     const input = event.target.closest("[data-question-field]");
     if (!input) return;
+    unsavedWork = true;
     recordTeacherEdit();
     const field = input.dataset.questionField;
     const value = input.value.slice(0, field === "stage" ? 80 : field === "prompt" ? 700 : 350);
     state.questions = state.questions.map((question) => question.id === input.dataset.editorId ? { ...question, [field]: value } : question);
-    renderQuestions(); persist();
+    renderQuestions(); updatePublishStatus(); persist();
   });
   $("#workflow-editor-list").addEventListener("input", (event) => {
     const input = event.target.closest("[data-step-field]");
     if (!input) return;
+    unsavedWork = true;
     recordTeacherEdit();
     const field = input.dataset.stepField;
     const value = input.value.slice(0, field === "title" ? 80 : 500);
     state.workflowSteps = state.workflowSteps.map((step) => step.id === input.dataset.editorId ? { ...step, [field]: value } : step);
-    renderProgress(); persist();
+    renderProgress(); updatePublishStatus(); persist();
   });
   function updateEditorList(type, id, action, targetId = "") {
     const isQuestion = type === "question";
@@ -2358,31 +2801,91 @@
     renderTeacherEditors(); renderProgress(); persist();
     $("#workflow-editor-list .lesson-editor-item:last-child [data-step-field='title']")?.focus();
   });
+  function pastedLines(text) {
+    return String(text || "").split(/\r?\n/).map((line) => line.trim().replace(/^(?:(?:\d+)[.)]|[-*•])\s*/, "")).filter(Boolean);
+  }
+  $("#paste-questions").addEventListener("click", () => {
+    const lines = pastedLines($("#bulk-question-paste").value).slice(0, 80);
+    if (!lines.length) { showToast("Paste one question on each line first."); return; }
+    recordTeacherEdit();
+    lines.forEach((prompt, index) => state.questions.push({ id: createId("question"), stage: `QUESTION ${state.questions.length + 1}`, prompt: prompt.slice(0, 700), hint: "", requiredQuestionIds: [] }));
+    $("#bulk-question-paste").value = "";
+    unsavedWork = true;
+    renderTeacherEditors(); renderQuestions(); persist();
+    showToast(`${lines.length} question${lines.length === 1 ? "" : "s"} added.`);
+  });
+  $("#paste-steps").addEventListener("click", () => {
+    const lines = pastedLines($("#bulk-step-paste").value).slice(0, 80);
+    if (!lines.length) { showToast("Paste one guide step on each line first."); return; }
+    recordTeacherEdit();
+    lines.forEach((title) => state.workflowSteps.push({ id: createId("step"), title: title.slice(0, 80), note: "Complete this step and check your evidence before moving on.", requiredQuestionIds: [], requireThreeTests: false, manual: true }));
+    $("#bulk-step-paste").value = "";
+    unsavedWork = true;
+    renderTeacherEditors(); renderProgress(); persist();
+    showToast(`${lines.length} guide step${lines.length === 1 ? "" : "s"} added.`);
+  });
+  $("#bulk-question-paste").addEventListener("input", () => { unsavedWork = true; });
+  $("#bulk-step-paste").addEventListener("input", () => { unsavedWork = true; });
   let draggedEditorItem = null;
+  let dragChanged = false;
   $$("#question-editor-list, #workflow-editor-list").forEach((list) => {
     list.addEventListener("dragstart", (event) => {
       const item = event.target.closest(".lesson-editor-item");
-      if (!item) return;
+      if (!item || event.target.closest("button, input, textarea")) { event.preventDefault(); return; }
       draggedEditorItem = item;
+      dragChanged = false;
+      item.classList.add("is-dragging");
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", item.dataset.editorId);
-      requestAnimationFrame(() => item.classList.add("is-dragging"));
     });
     list.addEventListener("dragover", (event) => {
       const target = event.target.closest(".lesson-editor-item");
       if (!target || target === draggedEditorItem) return;
       event.preventDefault();
-      target.classList.add("is-drop-target");
+      const rect = target.getBoundingClientRect();
+      const insertBefore = event.clientY < rect.top + rect.height / 2;
+      list.querySelectorAll(".is-drop-before, .is-drop-after").forEach((item) => item.classList.remove("is-drop-before", "is-drop-after"));
+      target.classList.add(insertBefore ? "is-drop-before" : "is-drop-after");
+      if (insertBefore && draggedEditorItem !== target.previousElementSibling) {
+        list.insertBefore(draggedEditorItem, target);
+        dragChanged = true;
+      } else if (!insertBefore && draggedEditorItem !== target.nextElementSibling) {
+        list.insertBefore(draggedEditorItem, target.nextElementSibling);
+        dragChanged = true;
+      }
+      list.querySelectorAll(".lesson-editor-item").forEach((item, index) => {
+        const label = item.querySelector(".lesson-editor-item-head strong");
+        if (label) label.lastChild.textContent = ` ${item.dataset.editorType === "question" ? "Question" : "Guide step"} ${index + 1}`;
+      });
     });
-    list.addEventListener("dragleave", (event) => event.target.closest(".lesson-editor-item")?.classList.remove("is-drop-target"));
     list.addEventListener("drop", (event) => {
-      const target = event.target.closest(".lesson-editor-item");
-      if (!target || !draggedEditorItem || target === draggedEditorItem) return;
+      if (!draggedEditorItem) return;
       event.preventDefault();
-      updateEditorList(target.dataset.editorType, draggedEditorItem.dataset.editorId, "drop", target.dataset.editorId);
-      draggedEditorItem = null;
+      if (dragChanged) {
+        recordTeacherEdit();
+        const type = list.id === "question-editor-list" ? "question" : "step";
+        const key = type === "question" ? "questions" : "workflowSteps";
+        const byId = new Map(state[key].map((item) => [item.id, item]));
+        state[key] = Array.from(list.querySelectorAll(".lesson-editor-item[data-editor-id]"), (item) => byId.get(item.dataset.editorId)).filter(Boolean);
+        unsavedWork = true;
+        renderTeacherEditors(); renderQuestions(); renderProgress(); persist();
+        dragChanged = false;
+      }
     });
-    list.addEventListener("dragend", () => { draggedEditorItem?.classList.remove("is-dragging"); list.querySelectorAll(".is-drop-target").forEach((item) => item.classList.remove("is-drop-target")); draggedEditorItem = null; });
+    list.addEventListener("dragend", () => {
+      draggedEditorItem?.classList.remove("is-dragging");
+      list.querySelectorAll(".is-drop-target, .is-drop-before, .is-drop-after").forEach((item) => item.classList.remove("is-drop-target", "is-drop-before", "is-drop-after"));
+      if (dragChanged) {
+        const type = list.id === "question-editor-list" ? "question" : "step";
+        const key = type === "question" ? "questions" : "workflowSteps";
+        const byId = new Map(state[key].map((item) => [item.id, item]));
+        state[key] = Array.from(list.querySelectorAll(".lesson-editor-item[data-editor-id]"), (item) => byId.get(item.dataset.editorId)).filter(Boolean);
+        unsavedWork = true;
+        renderTeacherEditors(); renderQuestions(); renderProgress(); persist();
+      }
+      draggedEditorItem = null;
+      dragChanged = false;
+    });
   });
   $("#undo-teacher-edit").addEventListener("click", () => moveTeacherEditor("undo"));
   $("#redo-teacher-edit").addEventListener("click", () => moveTeacherEditor("redo"));
@@ -2395,12 +2898,13 @@
   $("#save-teacher-edits").addEventListener("click", async () => {
     const button = $("#save-teacher-edits");
     captureClassState(); persist(); clearTimeout(cloudSaveTimer);
-    if (!cloudEnabled) { renderTeacher(); showToast("Lesson draft saved in this browser."); return; }
+    if (!cloudEnabled) { unsavedWork = false; renderTeacher(); showToast("Lesson draft saved in this browser."); return; }
     button.disabled = true; button.textContent = "Saving…";
     try {
       const record = activeClass();
       await cloudRequest("teacher-save", { classCode: record.code, teacherCode: record.teacherCode, classRecord: record });
       cloudLastSavedAt = new Date(); cloudSaveError = "";
+      unsavedWork = false;
       renderTeacher(); showToast("Lesson draft saved to the shared class.");
     } catch (error) {
       cloudSaveError = error?.message || "The lesson draft could not be saved.";
@@ -2419,7 +2923,7 @@
     const before = { published: state.published, publishedAt: state.publishedAt, publishedContent: state.publishedContent };
     state.published = true;
     state.publishedAt = new Date().toISOString();
-    state.publishedContent = { lessonTitle: state.lessonTitle, lessonIntentions: state.lessonIntentions, lessonDescription: state.lessonDescription, questions: structuredCloneSafe(state.questions), workflowSteps: structuredCloneSafe(state.workflowSteps), questionPrompts: state.questions.map((question) => question.prompt), workflowNotes: state.workflowSteps.map((step) => step.note) };
+    state.publishedContent = { lessonTitle: state.lessonTitle, lessonIntentions: state.lessonIntentions, lessonDescription: state.lessonDescription, questions: structuredCloneSafe(state.questions), workflowSteps: structuredCloneSafe(state.workflowSteps), customMaterials: structuredCloneSafe(state.customMaterials), questionPrompts: state.questions.map((question) => question.prompt), workflowNotes: state.workflowSteps.map((step) => step.note) };
     logEvent("lesson_published", { title: state.lessonTitle, publishedAt: state.publishedAt });
     captureClassState(); persist(); clearTimeout(cloudSaveTimer);
     button.disabled = true; button.textContent = "Publishing…";
@@ -2428,8 +2932,9 @@
         const record = activeClass();
         await cloudRequest("teacher-save", { classCode: record.code, teacherCode: record.teacherCode, classRecord: record });
         cloudLastSavedAt = new Date(); cloudSaveError = "";
+        unsavedWork = false;
         showToast(`Lesson published to students at ${new Date(state.publishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`);
-      } else showToast(`Lesson published on this device at ${new Date(state.publishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`);
+      } else { unsavedWork = false; showToast(`Lesson published on this device at ${new Date(state.publishedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`); }
     } catch (error) {
       state.published = before.published; state.publishedAt = before.publishedAt; state.publishedContent = before.publishedContent;
       cloudSaveError = error?.message || "The lesson could not be shared.";
@@ -2586,6 +3091,8 @@
       sessionStorage.removeItem(STUDENT_SESSION_KEY);
     }
     state.currentStudentId = null;
+    state.userRole = "teacher";
+    sessionStorage.setItem(ROLE_SESSION_KEY, "teacher");
     state.teacherPreview = false;
     state.selectedReplayStudentId = "";
     const record = activeClass();
@@ -2704,8 +3211,11 @@
         state.activeClassId = record.id;
         state.students = record.students;
         state.currentStudentId = record.students[0]?.id || null;
-        state.teacherPreview = routeParams.get("teacherPreview") === "1";
+        state.teacherPreview = entryRole === "teacher" && (state.teacherPreview || routeParams.get("teacherPreview") === "1");
         if (!state.currentStudentId) throw new Error("No learner record was returned for that roster name.");
+        state.userRole = "student";
+        state.introDone = false;
+        sessionStorage.setItem(ROLE_SESSION_KEY, "student");
         sessionStorage.setItem(STUDENT_SESSION_KEY, state.currentStudentId);
         sessionStorage.setItem(STUDENT_TOKEN_KEY, result.studentToken);
         window.history.replaceState({}, "", `${window.location.pathname}?mode=join${state.teacherPreview ? `&teacherPreview=1&code=${encodeURIComponent(code)}` : ""}`);
@@ -2714,6 +3224,7 @@
         state.lessonDescription = record.lessonDescription || "";
         state.questions = normalizeLessonQuestions(record.questions, record.questionPrompts);
         state.workflowSteps = normalizeWorkflowSteps(record.workflowSteps, record.workflowNotes);
+        setCustomMaterials(record.customMaterials || record.publishedContent?.customMaterials || []);
         state.published = Boolean(record.published);
         state.classClosed = Boolean(record.classClosed);
         state.answers = record.students[0].answers || {};
@@ -2724,7 +3235,7 @@
         applyActivitySnapshot(record.students[0].activity || record.activity);
         logEvent("student_joined", { name: record.students[0].name });
         $("#join-error").hidden = true;
-        persist(); renderAll(); renderTeacher(); showView("explore");
+        persist(); renderAll(); renderTeacher(); showView("intro");
         showToast(`Welcome back, ${record.students[0].name}. Your class is shared across devices.`);
         return;
       } catch (error) {
@@ -2741,21 +3252,25 @@
     if (!record) { $("#join-error").textContent = "No class was found with those details. Check the class code and roster name, then try again."; $("#join-error").hidden = false; return; }
     if (record.classClosed) { $("#join-error").textContent = "This class is closed. Please ask your teacher for help."; $("#join-error").hidden = false; return; }
     if (!record.published) { $("#join-error").textContent = "Your teacher has not published this lesson yet."; $("#join-error").hidden = false; return; }
-    if (!name) { $("#join-error").textContent = "Please enter your first, or first and last name"; $("#join-error").hidden = false; return; }
+    if (!name) { $("#join-error").textContent = "Enter your name to continue."; $("#join-error").hidden = false; return; }
     if (record.id !== state.activeClassId) activateClass(record.id);
     const needle = name.toLocaleLowerCase();
     const exact = state.students.find((student) => student.name.toLocaleLowerCase() === needle);
     const firstMatches = state.students.filter((student) => student.name.split(/\s+/)[0].toLocaleLowerCase() === needle);
     const existing = exact || (firstMatches.length === 1 ? firstMatches[0] : null);
-    if (!existing) { $("#join-error").textContent = "Please enter your first, or first and last name"; $("#join-error").hidden = false; return; }
+    if (!existing) { $("#join-error").textContent = "That name is not on the class list. Check the spelling and try again."; $("#join-error").hidden = false; return; }
     $("#join-error").hidden = true;
     state.currentStudentId = existing.id;
+    state.userRole = "student";
+    state.introDone = false;
+    sessionStorage.setItem(ROLE_SESSION_KEY, "student");
     const learnerLesson = record.publishedContent || record;
     state.lessonTitle = learnerLesson.lessonTitle || state.lessonTitle;
     state.lessonIntentions = learnerLesson.lessonIntentions || state.lessonIntentions;
     state.lessonDescription = learnerLesson.lessonDescription || state.lessonDescription;
     state.questions = normalizeLessonQuestions(learnerLesson.questions, learnerLesson.questionPrompts);
     state.workflowSteps = normalizeWorkflowSteps(learnerLesson.workflowSteps, learnerLesson.workflowNotes);
+    setCustomMaterials(learnerLesson.customMaterials || []);
     sessionStorage.setItem(STUDENT_SESSION_KEY, existing.id);
     window.history.replaceState({}, "", `${window.location.pathname}?mode=join`);
     if (state.teacherPreview) {
@@ -2771,7 +3286,7 @@
     state.events = Array.isArray(existing.events) ? existing.events.slice(-600) : [];
     applyActivitySnapshot(existing.activity || activeClass().activity);
     logEvent("student_joined", { name: existing.name });
-    persist(); renderAll(); renderTeacher(); showView("explore");
+    persist(); renderAll(); renderTeacher(); showView("intro");
     showToast(cloudEnabled ? `Welcome back, ${existing.name}. Your class work is shared across devices.` : `Welcome back, ${existing.name}. Your work is saved in this browser.`);
   });
   $("#join-code").addEventListener("input", (event) => { event.target.value = event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""); });
@@ -2792,6 +3307,48 @@
   $("#dialog-done").addEventListener("click", closeDialog);
   $("#info-dialog").addEventListener("click", (event) => { if (event.target === $("#info-dialog")) closeDialog(); });
   document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeDialog(); });
+
+  async function refreshReturningStudentSession() {
+    if (!cloudEnabled || !joiningFromLink || !returningStudentSession || !state.currentStudentId) return;
+    const previous = currentStudent();
+    const code = activeClass()?.code || routeParams.get("code") || "";
+    if (!previous || !code) return;
+    try {
+      const result = await cloudRequest("student-load", { classCode: code, studentName: previous.name });
+      const remote = result.classRecord || {};
+      const students = (Array.isArray(remote.students) ? remote.students : []).map(normalizeStudent);
+      const learner = students[0];
+      if (!learner) return;
+      const record = { ...makeClass(remote.name || "Class name", code, []), ...remote, code, teacherCode: "", students };
+      const lesson = record.publishedContent && typeof record.publishedContent === "object" ? record.publishedContent : record;
+      state.classRecords = [record];
+      state.activeClassId = record.id;
+      state.students = students;
+      state.currentStudentId = learner.id;
+      state.userRole = "student";
+      state.lessonTitle = lesson.lessonTitle || "Where does the water go?";
+      state.lessonIntentions = lesson.lessonIntentions || defaultLearningIntention;
+      state.lessonDescription = lesson.lessonDescription || "";
+      state.questions = normalizeLessonQuestions(lesson.questions, lesson.questionPrompts);
+      state.workflowSteps = normalizeWorkflowSteps(lesson.workflowSteps, lesson.workflowNotes);
+      setCustomMaterials(lesson.customMaterials || []);
+      state.published = Boolean(record.published);
+      state.classClosed = Boolean(record.classClosed);
+      state.answers = learner.answers || {};
+      state.submitted = Boolean(learner.submitted);
+      state.submittedAt = learner.submittedAt || null;
+      state.completedWorkflowSteps = learner.completedWorkflowSteps || [];
+      state.events = Array.isArray(learner.events) ? learner.events.slice(-600) : [];
+      applyActivitySnapshot(learner.activity || record.activity);
+      sessionStorage.setItem(STUDENT_SESSION_KEY, learner.id);
+      sessionStorage.setItem(STUDENT_TOKEN_KEY, result.studentToken || "");
+      persist();
+      clearTimeout(cloudSaveTimer);
+    } catch (error) {
+      showToast(`Could not refresh the shared lesson. Your saved copy is still available. ${error?.message || ""}`.trim());
+    }
+  }
+  await refreshReturningStudentSession();
 
   window.addEventListener("storage", (event) => {
     if (event.key !== STORAGE_KEY || !event.newValue) return;
@@ -2825,6 +3382,12 @@
     } catch { /* Ignore another tab's incomplete local save. */ }
   });
 
+  window.addEventListener("beforeunload", (event) => {
+    if (!unsavedWork) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+
   document.addEventListener("pointerdown", touchActivity, { passive: true });
   document.addEventListener("keydown", touchActivity);
 
@@ -2851,4 +3414,3 @@
   updateReplayControls();
   })();
 })();
-

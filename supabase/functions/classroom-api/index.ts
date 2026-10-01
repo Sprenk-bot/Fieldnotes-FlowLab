@@ -168,6 +168,8 @@ Deno.serve(async (request: Request) => {
         score: learner.score,
         answers: update.answers && typeof update.answers === "object" ? update.answers : learner.answers,
         submitted: Boolean(update.submitted),
+        submittedAt: update.submitted && update.submittedAt ? String(update.submittedAt).slice(0, 40) : null,
+        completedWorkflowSteps: Array.isArray(update.completedWorkflowSteps) ? update.completedWorkflowSteps.map(String) : learner.completedWorkflowSteps ?? [],
         completedMaterials: Array.isArray(update.completedMaterials) ? update.completedMaterials.slice(0, 40) : learner.completedMaterials,
         events: Array.isArray(update.events) ? update.events.slice(-600) : learner.events,
         marks: learner.marks ?? {},
@@ -180,6 +182,8 @@ Deno.serve(async (request: Request) => {
         percent: cleanLearner.percent,
         answers: cleanLearner.answers,
         submitted: cleanLearner.submitted,
+        submittedAt: cleanLearner.submittedAt,
+        completedWorkflowSteps: cleanLearner.completedWorkflowSteps,
         completedMaterials: cleanLearner.completedMaterials,
         events: cleanLearner.events,
         lastSeen: cleanLearner.lastSeen,
@@ -196,3 +200,4 @@ Deno.serve(async (request: Request) => {
     return reply(500, { error: error instanceof Error ? error.message : "Could not save classroom data." });
   }
 });
+

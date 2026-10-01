@@ -1435,9 +1435,11 @@
     $("#active-class-subtitle").textContent = `${record.students.length} ${record.students.length === 1 ? "learner" : "learners"} on the list`;
     $("#join-code-display").textContent = record.code;
     $("#teacher-recovery-code-display").textContent = record.teacherCode;
-    $("#sidebar-class-name").textContent = record.name;
-    $("#sidebar-class-code").textContent = record.code;
-    $("#sidebar-class-code").setAttribute("aria-label", `Class code ${record.code}`);
+    if ($("#sidebar-class-name")) $("#sidebar-class-name").textContent = record.name;
+    if ($("#sidebar-class-code")) {
+      $("#sidebar-class-code").textContent = record.code;
+      $("#sidebar-class-code").setAttribute("aria-label", `Class code ${record.code}`);
+    }
     $("#topbar-class-name").textContent = record.name;
     $("#header-view-identity").textContent = currentStudent()?.name || "Teacher View";
     $("#header-class-code").textContent = record.code;

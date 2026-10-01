@@ -2266,6 +2266,93 @@
     logEvent("intro_completed", { skipped });
     persist();
     showView("explore");
+    if (!skipped) setTimeout(startInvestigationTour, 220);
+  }
+
+  const investigationTour = [
+    ["Choose a material", "Start with the sample that best matches one of the materials you want to investigate. The library gives a short description of each one."],
+    ["Keep the comparison fair", "Water head, sample depth and compaction also affect flow. Keep these settings the same while you compare materials; later, change one setting at a time to explore its effect."],
+    ["Add materials to compare", "Choose up to two more samples. Their property bars are view-only: they help you compare model inputs, while the selected material controls remain the same for a fair test."],
+    ["Run the trial", "Select Start trial to see the simulated water move. The diagram is an illustration of the model, not a photograph or a real soil test."],
+    ["Watch the sample and readings", "The picture shows the model pathway. The collected volume and elapsed time below it give you values to record and compare."],
+    ["Read the graph", "The horizontal axis is time and the vertical axis is water collected. Compare materials at the same time, and read the labelled mL values if one line looks close to zero. The time slider lets you inspect earlier or later points."]
+  ];
+  let investigationTourStep = 0;
+  let investigationTourTarget = null;
+  let tourScrollHandler = null;
+  let tourResizeHandler = null;
+  let tourKeyHandler = null;
+
+  function positionInvestigationTour() {
+    if (!investigationTourTarget || $("#investigation-tour").hidden) return;
+    const targetRect = investigationTourTarget.getBoundingClientRect();
+    const spotlight = $("#investigation-tour-spotlight");
+    const card = $(".investigation-tour-card");
+    const pad = 7;
+    spotlight.style.left = `${Math.max(4, targetRect.left - pad)}px`;
+    spotlight.style.top = `${Math.max(4, targetRect.top - pad)}px`;
+    spotlight.style.width = `${Math.max(24, Math.min(window.innerWidth - 8, targetRect.width + pad * 2))}px`;
+    spotlight.style.height = `${Math.max(24, Math.min(window.innerHeight - 8, targetRect.height + pad * 2))}px`;
+
+    const cardRect = card.getBoundingClientRect();
+    const gap = 16;
+    const below = targetRect.bottom + gap;
+    const above = targetRect.top - cardRect.height - gap;
+    const top = below + cardRect.height <= window.innerHeight - 12
+      ? below
+      : above >= 12 ? above : Math.max(12, window.innerHeight - cardRect.height - 12);
+    const left = Math.min(Math.max(12, targetRect.left + targetRect.width / 2 - cardRect.width / 2), window.innerWidth - cardRect.width - 12);
+    card.style.top = `${top}px`;
+    card.style.left = `${left}px`;
+  }
+
+  function showInvestigationTourStep(index) {
+    investigationTourStep = Math.max(0, Math.min(index, investigationTour.length - 1));
+    const [title, copy] = investigationTour[investigationTourStep];
+    const selectors = ["#material-picker-trigger", "#head-range", "#compare-picker-trigger", "#run-trial", "#activity-visual", "#volume-chart"];
+    investigationTourTarget = $(selectors[investigationTourStep]);
+    if (!investigationTourTarget) return endInvestigationTour();
+    $("#investigation-tour-title").textContent = title;
+    $("#investigation-tour-copy").textContent = copy;
+    $("#investigation-tour-progress").textContent = `STEP ${investigationTourStep + 1} OF ${investigationTour.length}`;
+    $("#investigation-tour-back").disabled = investigationTourStep === 0;
+    $("#investigation-tour-next").textContent = investigationTourStep === investigationTour.length - 1 ? "Finish" : "Next";
+    investigationTourTarget.scrollIntoView({ behavior: accessibilitySettings.reduceMotion ? "auto" : "smooth", block: "center", inline: "nearest" });
+    requestAnimationFrame(() => { positionInvestigationTour(); setTimeout(positionInvestigationTour, 220); });
+    $("#investigation-tour-next").focus({ preventScroll: true });
+  }
+
+  function startInvestigationTour() {
+    closeDialog();
+    const frame = $(".app-frame");
+    if (frame) frame.inert = true;
+    $("#investigation-tour").hidden = false;
+    tourScrollHandler = () => positionInvestigationTour();
+    tourResizeHandler = () => positionInvestigationTour();
+    tourKeyHandler = (event) => {
+      if (event.key === "Escape") { event.preventDefault(); endInvestigationTour(); return; }
+      if (event.key !== "Tab") return;
+      const controls = [$("#investigation-tour-skip"), $("#investigation-tour-back"), $("#investigation-tour-next")].filter((button) => !button.disabled);
+      const first = controls[0]; const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("scroll", tourScrollHandler, true);
+    window.addEventListener("resize", tourResizeHandler);
+    document.addEventListener("keydown", tourKeyHandler);
+    showInvestigationTourStep(0);
+  }
+
+  function endInvestigationTour() {
+    const wasOpen = !$("#investigation-tour").hidden;
+    $("#investigation-tour").hidden = true;
+    const frame = $(".app-frame");
+    if (frame) frame.inert = false;
+    if (tourScrollHandler) document.removeEventListener("scroll", tourScrollHandler, true);
+    if (tourResizeHandler) window.removeEventListener("resize", tourResizeHandler);
+    if (tourKeyHandler) document.removeEventListener("keydown", tourKeyHandler);
+    tourScrollHandler = tourResizeHandler = tourKeyHandler = null;
+    if (wasOpen) $("#material-picker-trigger")?.focus({ preventScroll: true });
   }
 
   let teacherTourStep = 0;
@@ -2547,6 +2634,12 @@
   });
   $("#skip-intro").addEventListener("click", () => completeIntro(true));
   $("#start-investigation").addEventListener("click", () => completeIntro(false));
+  $("#investigation-tour-next").addEventListener("click", () => {
+    if (investigationTourStep === investigationTour.length - 1) endInvestigationTour();
+    else showInvestigationTourStep(investigationTourStep + 1);
+  });
+  $("#investigation-tour-back").addEventListener("click", () => showInvestigationTourStep(investigationTourStep - 1));
+  $("#investigation-tour-skip").addEventListener("click", endInvestigationTour);
   $("#grain-model-range").addEventListener("input", renderPoreModel);
   $("#path-model-range").addEventListener("input", renderPoreModel);
   $("#grain-model-range").addEventListener("change", persist);
@@ -3414,3 +3507,4 @@
   updateReplayControls();
   })();
 })();
+

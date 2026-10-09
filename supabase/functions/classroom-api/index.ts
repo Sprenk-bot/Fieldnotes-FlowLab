@@ -9,7 +9,7 @@ const cors = {
 };
 const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
 const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const publicKey = Deno.env.get("SUPABASE_ANON_KEY") ?? Deno.env.get("SUPABASE_PUBLISHABLE_KEY") ?? "sb_publishable_61I9or8HLKyKkW2qYPWVCA_Akdu9774";
+const publicKeys = [...Object.values(JSON.parse(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS") ?? "{}")), Deno.env.get("SUPABASE_PUBLISHABLE_KEY"), Deno.env.get("SUPABASE_ANON_KEY"), "sb_publishable_61I9or8HLKyKkW2qYPWVCA_Akdu9774"].filter(Boolean);
 const db = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
 
 function reply(status: number, body: unknown) {
@@ -91,7 +91,7 @@ async function verifyStudentSession(token: unknown, classCode: string) {
 Deno.serve(async (request: Request) => {
   if (request.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (request.method !== "POST") return reply(405, { error: "Use POST for classroom actions." });
-  if (!publicKey || request.headers.get("apikey") !== publicKey) return reply(401, { error: "This app is not configured for classroom access." });
+  if (!publicKeys.includes(request.headers.get("apikey") ?? "")) return reply(401, { error: "This app is not configured for classroom access." });
 
   try {
     const body = await request.json();

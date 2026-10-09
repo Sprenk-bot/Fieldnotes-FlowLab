@@ -1,6 +1,6 @@
-# Fieldnotes — Water & the land
+# Fieldnotes — FlowLab
 
-A responsive, browser-based classroom tool for investigating water movement through soil and rock. Teachers can adapt its class name and roster for their own groups.
+A responsive, browser-based classroom tool for investigating water movement through soil and rock. Teachers can tailor the class and roster to their needs.
 
 ## Open the website
 
